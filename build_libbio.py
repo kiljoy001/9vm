@@ -3,7 +3,7 @@ import os
 import sys
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 LIBBIO_DIR = os.path.join(REPO_ROOT, "sys/src/libbio")
 BUILD_DIR = os.path.join(REPO_ROOT, "build/libbio")
 OUT_LIB = os.path.join(REPO_ROOT, "build/libbio.a")

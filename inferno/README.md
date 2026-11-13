@@ -29,7 +29,7 @@ loop.  Everything here was used to validate the state described at the bottom.
 
 ## Prerequisites
 
-- 9vm built: `make -C util/9vm 9vm`
+- 9vm built: `make -C .. 9vm`
 - a purgatorio checkout next to this one (`../purgatorio`; override with `$PURGATORIO`)
 - the Inferno 386 toolchain in `$PURGATORIO/Linux/386/bin` and `mk` on `PATH`
 - `$NINEVM_WORK` (default `/tmp/9vm-inferno`) is where build outputs and images go
@@ -37,7 +37,7 @@ loop.  Everything here was used to validate the state described at the bottom.
 ## Build
 
 ```sh
-cd ../purgatorio/os/pc
+cd ../../purgatorio/os/pc
 ROOT=../.. PATH=../../Linux/386/bin:/usr/local/plan9/bin:$PATH mk
 cd -
 ./mkelf.py                # writes $NINEVM_WORK/ipc.elf
@@ -47,7 +47,7 @@ The kernel embeds `/osinit.dis` and the root tree from `os/pc/pc`, so rebuilding
 the init means rebuilding the kernel:
 
 ```sh
-cd ../purgatorio/os/init
+cd ../../purgatorio/os/init
 ROOT=../.. PATH=../../Linux/386/bin:/usr/local/plan9/bin:$PATH mk shell.dis
 # then rebuild os/pc again and re-run mkelf.py
 ```

@@ -10,7 +10,7 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../../.." && pwd)
+repo=$(cd "$here/.." && pwd)
 work=${NINEVM_WORK:-/tmp/9vm-inferno}
 shm=
 net=
@@ -27,8 +27,8 @@ done
 img=${1:-$work/root.img}
 elf=${2:-$work/ipc.elf}
 
-[ -x "$repo/util/9vm/9vm" ] || {
-	echo "build 9vm first: make -C $repo/util/9vm 9vm" >&2; exit 1; }
+[ -x "$repo/9vm" ] || {
+	echo "build 9vm first: make -C $repo 9vm" >&2; exit 1; }
 [ -f "$img" ] || {
 	echo "missing $img (run ./provision.sh, or gunzip root.img.gz)" >&2; exit 1; }
 [ -f "$elf" ] || { echo "missing $elf (run ./mkelf.py)" >&2; exit 1; }
@@ -42,4 +42,4 @@ if [ -n "$shm" ]; then
 	rm -f "/dev/shm/${shm#/}"
 	set -- "$@" -display-shm "$shm"
 fi
-exec "$repo/util/9vm/9vm" "$@" "$elf"
+exec "$repo/9vm" "$@" "$elf"

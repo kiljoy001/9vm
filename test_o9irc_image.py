@@ -7,7 +7,7 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 HERE = Path(__file__).resolve().parent
 
 

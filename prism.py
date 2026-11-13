@@ -12,14 +12,14 @@ import sys
 import tempfile
 import time
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 O9_REPO = os.path.abspath(os.environ.get(
     "O9_REPO", os.path.join(REPO_ROOT, "..", "objective-9c")))
 _host_o9c = os.path.join(REPO_ROOT, "build/host/o9c")
 O9C_BIN = (os.environ.get("O9C_BIN") or
            (_host_o9c if os.path.isfile(_host_o9c) else
             os.path.join(O9_REPO, "o9c/o9c")))
-VM_BIN = os.path.join(REPO_ROOT, "util/9vm/9vm")
+VM_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "9vm")
 KERNEL_BIN = os.path.join(REPO_ROOT, "build/harvey.32bit")
 
 CC = "clang"

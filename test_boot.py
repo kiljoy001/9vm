@@ -11,11 +11,11 @@ import re
 import queue
 import threading
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-VM_BIN = os.path.join(REPO_ROOT, "util/9vm/9vm")
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
+VM_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "9vm")
 KERNEL_BIN = os.path.join(REPO_ROOT, "build/harvey.32bit")
-BUILD_BOOT = os.path.join(REPO_ROOT, "util/9vm/build_boot.py")
-BUILD_KERNEL = os.path.join(REPO_ROOT, "util/9vm/build_kernel.py")
+BUILD_BOOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_boot.py")
+BUILD_KERNEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_kernel.py")
 
 REQUIRED_ASSERTIONS = [
     ("kernel_banner", "Harvey"),

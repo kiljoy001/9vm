@@ -12,15 +12,15 @@
 set -eu
 
 here=$(cd "$(dirname "$0")" && pwd)
-repo=$(cd "$here/../../.." && pwd)
+repo=$(cd "$here/.." && pwd)
 work=${NINEVM_WORK:-/tmp/9vm-inferno}
 elf=${1:-$work/ipc.elf}
 img=${2:-$work/root.img}
-vm=$repo/util/9vm/9vm
+vm=$repo/9vm
 log=$work/provision.log
 
 mkdir -p "$work"
-[ -x "$vm" ] || { echo "build $vm first (make -C $repo/util/9vm)" >&2; exit 1; }
+[ -x "$vm" ] || { echo "build $vm first (make -C $repo)" >&2; exit 1; }
 [ -f "$elf" ] || { echo "missing $elf (run ./mkelf.py)" >&2; exit 1; }
 
 rm -f "$img"

@@ -5,7 +5,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 OBJ = ROOT / "build/v64init.o"
 OUT = ROOT / "build/v64init"
 CFLAGS = [

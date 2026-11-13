@@ -5,7 +5,7 @@ import os
 import subprocess
 import sys
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 BUILD = os.path.join(REPO_ROOT, "build")
 NDB = os.path.join(REPO_ROOT, "sys/src/cmd/ndb")
 MAIN9 = os.path.join(BUILD, "libc", "amd64_main9.o")

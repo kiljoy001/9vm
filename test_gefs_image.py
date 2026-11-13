@@ -7,10 +7,10 @@ import subprocess
 import sys
 import tempfile
 
-ROOT = Path(__file__).resolve().parents[2]
-VM = ROOT / "util/9vm/9vm"
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
+VM = Path(__file__).resolve().parent / "9vm"
 KERNEL = ROOT / "build/harvey.32bit"
-FORMAT = ROOT / "util/9vm/format_gefs_image.py"
+FORMAT = Path(__file__).resolve().parent / "format_gefs_image.py"
 
 
 def boot(image, extra, marker, use_ring=True):

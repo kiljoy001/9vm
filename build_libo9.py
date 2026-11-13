@@ -3,7 +3,7 @@ import os
 import sys
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 O9_REPO = os.path.abspath(os.environ.get(
     "O9_REPO", os.path.join(REPO_ROOT, "..", "objective-9c")))
 LIBTAB_DIR = os.path.join(O9_REPO, "libtab")

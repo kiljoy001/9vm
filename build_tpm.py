@@ -3,7 +3,7 @@
 import os
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 SRC_DIR = os.path.join(REPO_ROOT, "sys/src/cmd/tpm")
 BUILD_DIR = os.path.join(REPO_ROOT, "build/tpm")
 

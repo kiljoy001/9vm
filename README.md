@@ -1,4 +1,49 @@
-# 9vm host 9P transports
+# 9vm
+
+A KVM microVM runner for Harvey, Purgatorio/Inferno, and GEFS guests.  It
+provides a small VMM, shared-memory and virtio transports for the host
+filesystem, a virtio network device, and a shared-memory display.
+
+## Layout
+
+- `9vm.c`, `hostfs.c`, `hostfs.h`, `vmdisplay.h` — the VMM, host 9P server,
+  and display device.
+- `9ring.h` — the shared-memory 9P ring definition used by the guest.
+- `inferno/` — boot and provision harness for the native Purgatorio kernel.
+- `build_*.py`, `prism.py`, `test_*.py` — Harvey and Objective-9C guest build
+  helpers.  They use `HARVEY` (default `../harvey`) and `O9_REPO`.
+
+## Build
+
+```sh
+make 9vm
+```
+
+## Purgatorio / Inferno
+
+The harness expects a sibling `purgatorio` checkout (override with
+`PURGATORIO`) and writes its images under `NINEVM_WORK`
+(default `/tmp/9vm-inferno`):
+
+```sh
+cd inferno
+./mkelf.py
+./boot.sh
+```
+
+`boot.sh -n tap0` adds the virtio-net TAP; see `inferno/README.md` for the
+network and display details.
+
+The Harvey guest build helpers are run from this directory after setting
+`HARVEY`:
+
+```sh
+HARVEY=/path/to/harvey
+python3 build_kernel.py
+python3 test_boot.py
+```
+
+## Host 9P transports
 
 ## Plain QEMU (amd64)
 
@@ -7,7 +52,7 @@ can load it directly with the GEFS image as a Multiboot module — no 9vm, no
 v86:
 
 ```sh
-sh util/9vm/run-qemu.sh
+sh run-qemu.sh
 ```
 
 It boots to Rio on the Bochs framebuffer with the VPS flavour of the embedded
@@ -23,7 +68,7 @@ HARVEY_GEFS_INIT=boot/vps_init.o9 HARVEY_GEFS_INIT_BIN=build/vpsinit \
 HARVEY_BUILD_DIR=build/kernel-vps \
 HARVEY_OUT_ELF=build/harvey-vps.elf \
 HARVEY_OUT_32BIT=build/harvey-vps.32bit \
-python3 util/9vm/build_kernel.py
+python3 build_kernel.py
 ```
 
 The kernel names the module after the loader's path *and* always registers
@@ -81,11 +126,11 @@ is separate from the host transport and is not a memory-mapped user API.
 Build and run both guest transports:
 
 ```sh
-make -C util/9vm 9vm
-python3 util/9vm/build_boot.py
-python3 util/9vm/build_kernel.py
-python3 util/9vm/test_boot.py
-python3 util/9vm/bench_9p.py -n 3
+make 9vm
+python3 build_boot.py
+python3 build_kernel.py
+python3 test_boot.py
+python3 bench_9p.py -n 3
 ```
 
 The test boots through each transport and checks a 100,000-byte create,
@@ -114,9 +159,9 @@ side attached to a TAP device named by `-net-tap <if>`.
 experiments are retired; they are not in the boot path.
 
 ```sh
-python3 util/9vm/build_kernel.py
-python3 util/9vm/test_net.py   # kernel #I IL loopback
-util/9vm/9vm -net-tap tap0 ... # virtio-net + host TAP
+python3 build_kernel.py
+python3 test_net.py   # kernel #I IL loopback
+./9vm -net-tap tap0 ... # virtio-net + host TAP
 ```
 Storage follows the same rule: `-gefs-image` exports the disk image as a
 9P file (`#9/2`), a user-space GEFS server runs on `/mnt/image`, and the
@@ -129,7 +174,7 @@ server when it is ready.
 Create a new 512 MiB image using an installed 9front VM as the formatter:
 
 ```sh
-python3 util/9vm/format_gefs_image.py --base /path/to/installed-9front.img /path/to/gefs.img
+python3 format_gefs_image.py --base /path/to/installed-9front.img /path/to/gefs.img
 ```
 
 The script refuses to overwrite an existing image. It formats, mounts, writes
@@ -140,9 +185,9 @@ Prism workload with `--gefs-image /path/to/gefs.img`. The guest sees one file,
 GEFS compatibility server from a sibling 9front source checkout, then boot:
 
 ```sh
-python3 util/9vm/build_gefs_guest.py
-python3 util/9vm/build_kernel.py
-util/9vm/9vm -gefs-image /path/to/gefs.img build/harvey.32bit
+python3 build_gefs_guest.py
+python3 build_kernel.py
+./9vm -gefs-image /path/to/gefs.img build/harvey.32bit
 ```
 
 With `-gefs-image`, 9vm defaults to an isolated image boot. The kernel's
@@ -179,15 +224,15 @@ There is no MBR, partition, `#S`, or block driver in the microVM; GEFS runs
 entirely in user space on a 9P file.
 
 ```sh
-python3 util/9vm/build_gefs_guest.py
-python3 util/9vm/build_kernel.py
-python3 util/9vm/install_gefs.py -o /tmp/9vm/gefs.img -s 192
+python3 build_gefs_guest.py
+python3 build_kernel.py
+python3 install_gefs.py -o /tmp/9vm/gefs.img -s 192
 ```
 
 Boot the installed image (isolated: only the image is exported):
 
 ```sh
-util/9vm/9vm -gefs-image /tmp/9vm/gefs.img build/harvey.32bit
+./9vm -gefs-image /tmp/9vm/gefs.img build/harvey.32bit
 ```
 
 `ASPERA-GEFS-ROOT PASS` means the GEFS tree was mounted as `/`; the init then
@@ -199,15 +244,15 @@ milestones from the serial log and samples the 9vm process CPU over an idle
 window (which includes the host ring's polling thread):
 
 ```sh
-python3 util/9vm/bench_boot.py --image /tmp/9vm/gefs.img -n 3
+python3 bench_boot.py --image /tmp/9vm/gefs.img -n 3
 ```
 
 Run the image transport regression, including a 9front format/reboot and two
 9vm boots:
 
 ```sh
-python3 util/9vm/test_gefs_image.py --base /path/to/installed-9front.img
-python3 util/9vm/test_gefs_guest.py --base /path/to/installed-9front.img
+python3 test_gefs_image.py --base /path/to/installed-9front.img
+python3 test_gefs_guest.py --base /path/to/installed-9front.img
 ```
 
 The guest regression writes through Harvey's GEFS mount, reboots Harvey to
@@ -222,7 +267,7 @@ parent nor the second child inherits that mount. It then writes and syncs a
 file before rebooting into a verification pass:
 
 ```sh
-python3 util/9vm/build_kernel.py
+python3 build_kernel.py
 ./bin/aspera verify
 ```
 
@@ -237,8 +282,8 @@ and rejects service restarts. Pass `--base` to exercise formatting and
 provisioning as well:
 
 ```sh
-python3 util/9vm/test_driver_image.py
-python3 util/9vm/test_driver_image.py --base /path/to/installed-9front.img
+python3 test_driver_image.py
+python3 test_driver_image.py --base /path/to/installed-9front.img
 ```
 
 ## Include o9irc
@@ -247,9 +292,9 @@ Build o9irc and provision its binaries into an existing GEFS image using
 9front's native GEFS implementation:
 
 ```sh
-python3 util/9vm/install_o9irc.py --base /path/to/installed-9front.img --image build/aspera-gefs.img
-python3 util/9vm/build_kernel.py
-util/9vm/9vm -gefs-image build/aspera-gefs.img build/harvey.32bit
+python3 install_o9irc.py --base /path/to/installed-9front.img --image build/aspera-gefs.img
+python3 build_kernel.py
+./9vm -gefs-image build/aspera-gefs.img build/harvey.32bit
 ```
 
 The image contains `/bin/o9irc-ircfs`, `/bin/o9irc-gui`, and
@@ -269,7 +314,7 @@ The disposable end-to-end test formats a fresh image, installs o9irc, boots
 Aspera without a host tree, and reads the live 9P view:
 
 ```sh
-python3 util/9vm/test_o9irc_image.py --base /path/to/installed-9front.img
+python3 test_o9irc_image.py --base /path/to/installed-9front.img
 ```
 
 The benchmark performs cached sequential reads and open/close operations

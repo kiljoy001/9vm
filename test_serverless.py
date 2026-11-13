@@ -9,8 +9,8 @@ import subprocess
 import sys
 import time
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-PRISM_BIN = os.path.join(REPO_ROOT, "util/9vm/prism.py")
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
+PRISM_BIN = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prism.py")
 TEST_O9 = os.path.join(REPO_ROOT, "boot/test_serverless.o9")
 
 REQUIRED_OUTPUTS = [

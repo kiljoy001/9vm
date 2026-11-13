@@ -9,7 +9,7 @@ import tempfile
 
 from format_gefs_image import SERIAL_INI, boot_and_check, ninefat_offset
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 HERE = Path(__file__).resolve().parent
 KERNEL = ROOT / "build/harvey.32bit"
 VM = HERE / "9vm"

@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 UCC_REPO = Path(os.environ.get("UCC_REPO", ROOT / "../ucc")).resolve()
 BUILD = ROOT / "build"
 BUILD.mkdir(parents=True, exist_ok=True)

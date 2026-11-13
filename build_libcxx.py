@@ -6,9 +6,9 @@ aligned allocation, with exceptions/RTTI/threads/locales/filesystem disabled.
 It is deliberately small and reproducible; it is not a full libc++ port yet.
 
 Usage:
-    util/9vm/build_libcxx.py            # build build/libcxx/lib/libc++.a + test
-    util/9vm/build_libcxx.py --run      # also boot it under 9vm
-    util/9vm/build_libcxx.py --clean
+    ./build_libcxx.py            # build build/libcxx/lib/libc++.a + test
+    ./build_libcxx.py --run      # also boot it under 9vm
+    ./build_libcxx.py --clean
 
 Environment:
     LIBCXX_SRC   libcxx source tree (default ../llvm-project/libcxx)
@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(os.environ.get(
-    "HARVEY", Path(__file__).resolve().parents[2])).resolve()
+    "HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 LIBCXX = Path(os.environ.get(
     "LIBCXX_SRC", REPO_ROOT.parent / "llvm-project" / "libcxx")).resolve()
 LIBCXXABI = LIBCXX.parent / "libcxxabi"

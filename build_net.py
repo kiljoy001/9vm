@@ -4,7 +4,7 @@
 import os
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 BUILD = os.path.join(REPO_ROOT, "build")
 MAIN9 = os.path.join(BUILD, "libc", "amd64_main9.o")
 
@@ -44,7 +44,7 @@ def link(name: str, objs: list[str], libs: list[str]) -> None:
 
 def main() -> None:
     if not os.path.exists(os.path.join(BUILD, "libip.a")):
-        subprocess.run(["python3", os.path.join(REPO_ROOT, "util/9vm/build_libip.py")], check=True)
+        subprocess.run(["python3", os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_libip.py")], check=True)
 
     ipc = os.path.join(REPO_ROOT, "sys/src/cmd/ip/ipconfig")
     objs = [compile_one(os.path.join(ipc, f), (f"-I{ipc}",))

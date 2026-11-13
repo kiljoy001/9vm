@@ -5,8 +5,8 @@ import subprocess
 import sys
 import time
 
-ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
-PRISM = os.path.join(ROOT, "util/9vm/prism.py")
+ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
+PRISM = os.path.join(os.path.dirname(os.path.abspath(__file__)), "prism.py")
 TEST_O9 = os.path.join(ROOT, "boot/test_kernel_net.o9")
 REQUIRED = [
     "o9-knet: loopback 127.0.0.1/8 up",

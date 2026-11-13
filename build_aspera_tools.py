@@ -8,7 +8,7 @@ import shutil
 import subprocess
 
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 BUILD = ROOT / "build"
 CFLAGS = [
     "-c", "-O2", "-static", "-mno-red-zone", "-mno-implicit-float",

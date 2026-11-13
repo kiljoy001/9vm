@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import subprocess
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 SOURCE = ROOT / "sys/src/libflate"
 BUILD = ROOT / "build/libflate"
 OUTPUT = ROOT / "build/libflate.a"

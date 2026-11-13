@@ -1,9 +1,9 @@
 #!/bin/sh
 # Boot the amd64 microkernel under plain QEMU, without 9vm or v86.
 #
-#	sh util/9vm/run-qemu.sh                 # SDL/GTK window
-#	sh util/9vm/run-qemu.sh -display none -vnc :1
-#	KERNEL=... IMAGE=... sh util/9vm/run-qemu.sh
+#	sh run-qemu.sh                 # SDL/GTK window
+#	sh run-qemu.sh -display none -vnc :1
+#	KERNEL=... IMAGE=... sh run-qemu.sh
 #
 # The kernel is a 64-bit Harvey in a 32-bit Multiboot wrapper (build_kernel.py
 # makes it with objcopy); QEMU loads it and the GEFS image as a module.  The
@@ -13,16 +13,16 @@
 # symlink called "initrd", which costs nothing and keeps both working.
 set -e
 
-ROOT=$(cd "$(dirname "$0")/../.." && pwd)
+ROOT=${HARVEY:-$(cd "$(dirname "$0")/../harvey" && pwd)}
 KERNEL=${KERNEL:-$ROOT/build/harvey-vps.32bit}
 IMAGE=${IMAGE:-$ROOT/build/aspera-vps.gefs}
 
 test -f "$KERNEL" || {
-	echo "run-qemu: no kernel at $KERNEL (util/9vm/build_kernel.py)" >&2
+	echo "run-qemu: no kernel at $KERNEL (build_kernel.py)" >&2
 	exit 1
 }
 test -f "$IMAGE" || {
-	echo "run-qemu: no GEFS image at $IMAGE (util/9vm/install_gefs.py)" >&2
+	echo "run-qemu: no GEFS image at $IMAGE (install_gefs.py)" >&2
 	exit 1
 }
 

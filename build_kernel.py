@@ -3,7 +3,7 @@ import os
 import sys
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 # Alternate init/output let the VPS flavour be built alongside the stock
 # kernel without disturbing 9vm install/tests.
 BUILD_DIR = os.environ.get("HARVEY_BUILD_DIR", os.path.join(REPO_ROOT, "build/kernel"))
@@ -252,7 +252,7 @@ def build_init():
     init_out = os.path.join(REPO_ROOT, "build/init")
     init_h = os.path.join(REPO_ROOT, "sys/src/9/amd64/init.h")
     libc_a = os.path.join(REPO_ROOT, "build/libc.a")
-    elf2c_py = os.path.join(REPO_ROOT, "util/9vm/elf2c.py")
+    elf2c_py = os.path.join(os.path.dirname(os.path.abspath(__file__)), "elf2c.py")
 
     init9_obj = os.path.join(REPO_ROOT, "build/init9.o")
     initcode_obj = os.path.join(REPO_ROOT, "build/initcode.o")
@@ -290,7 +290,7 @@ def main():
     if not os.path.exists(gefs_init_bin) or os.path.getmtime(gefs_init_bin) < os.path.getmtime(gefs_init):
         compile_o9(gefs_init, gefs_init_bin)
     if not os.path.exists(gefs_server):
-        subprocess.run([sys.executable, os.path.join(REPO_ROOT, "util/9vm/build_gefs_guest.py")], check=True)
+        subprocess.run([sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "build_gefs_guest.py")], check=True)
     embedded = os.path.join(BUILD_DIR, "embedded_gefs.S")
     with open(embedded, "w") as f:
         f.write('.section .rodata\n.balign 4096\n')

@@ -34,7 +34,7 @@ def main():
                     default=Path(os.environ.get("NINEVM_WORK", "/tmp/9vm-inferno")))
     args = ap.parse_args()
 
-    repo = HERE.parents[2]
+    repo = HERE.parents[1]
     purg = Path(os.environ.get("PURGATORIO", str(repo.parent / "purgatorio")))
     kernel = args.kernel or (purg / "os/pc/ipc")
     if not kernel.is_file():

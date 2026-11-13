@@ -117,7 +117,7 @@ separate, narrow display exchange on `#9/0`. A power-loss fault test remains
 before host-crash consistency can be claimed.
 
 `sys/src/cmd/o9sophia` remains an Objective-9C filesystem experiment, tested
-by `util/9vm/test_sophia.py`. It is not a prerequisite for persistent storage
+by `./test_sophia.py`. It is not a prerequisite for persistent storage
 in this microVM. A native disk filesystem may still matter for a later
 standalone or bare-metal Aspera system.
 

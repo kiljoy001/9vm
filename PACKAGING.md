@@ -26,7 +26,7 @@ To provision an existing GEFS image, using an installed 9front VM image as the
 native GEFS writer:
 
 ```sh
-python3 util/9vm/install_aspera.py --base /path/to/9front.img --image /path/to/aspera.img
+python3 install_aspera.py --base /path/to/9front.img --image /path/to/aspera.img
 ```
 
 The script compiles the desktop and shelf from Objective-9C source, builds the
@@ -35,7 +35,7 @@ the copies, and syncs GEFS.
 Keep a backup of an image before provisioning it. `bin/aspera start --smoke`
 checks the installed desktop's frame, input, Notes, and terminal command path.
 The source VM regression for persistent `rc` state and close/reopen is
-`python3 util/9vm/test_aspera_terminal.py`.
+`python3 test_aspera_terminal.py`.
 
 The graphical development preview has a separate command:
 
@@ -56,11 +56,11 @@ directory, the current build sequence is:
 
 ```sh
 for lib in libc libbio libndb libsec libauth libauthsrv libthread lib9p libdraw libo9; do
-    python3 "util/9vm/build_${lib}.py" || exit
+    python3 "./build_${lib}.py" || exit
 done
-python3 util/9vm/build_gefs_guest.py
-python3 util/9vm/build_kernel.py
-make -C util/9vm 9vm
+python3 build_gefs_guest.py
+python3 build_kernel.py
+make 9vm
 ./bin/aspera check
 ```
 
@@ -69,7 +69,7 @@ Set `O9_REPO` for Objective-9C and pass `--source /path/to/plan9front` to
 the runtime bundle below is not assembled yet.
 
 The built guest kernel is `build/harvey.32bit`, the host runner is
-`util/9vm/9vm`, and Objective-9C archives are under `build/`. `check` names
+`./9vm`, and Objective-9C archives are under `build/`. `check` names
 missing inputs. The build instructions and transport tests are in
 [README.md](README.md).
 

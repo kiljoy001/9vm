@@ -7,7 +7,7 @@ import shutil
 import subprocess
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 HERE = Path(__file__).resolve().parent
 COMPAT = HERE / "gefs_compat"
 SOURCES = ("blk", "cache", "check", "cons", "dump", "error", "fs",

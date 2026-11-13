@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 import os, subprocess, sys
 from pathlib import Path
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 O9 = Path(os.environ.get("O9_REPO", ROOT.parent / "objective-9c"))
 SRC = ROOT / "boot/halatha_init.o9"
 C = ROOT / "build/halatha_init.o9.c"

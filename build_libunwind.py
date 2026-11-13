@@ -8,8 +8,8 @@ compat.cpp) report the single static image, so libunwind's normal ELF path
 works unmodified.
 
 Usage:
-    util/9vm/build_libunwind.py
-    util/9vm/build_libunwind.py --clean
+    ./build_libunwind.py
+    ./build_libunwind.py --clean
 
 Output: build/libcxx/lib/libunwind.a
 """
@@ -21,7 +21,7 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(os.environ.get(
-    "HARVEY", Path(__file__).resolve().parents[2])).resolve()
+    "HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 LLVM = Path(os.environ.get(
     "LLVM_PROJECT", REPO_ROOT.parent / "llvm-project")).resolve()
 LIBUNWIND = LLVM / "libunwind"

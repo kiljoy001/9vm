@@ -26,7 +26,7 @@
 #include <pthread.h>
 #include <sched.h>
 #include "hostfs.h"
-#include "../../sys/include/9ring.h"
+#include "9ring.h"
 
 static struct timespec ts_boot_start;
 static inline double get_boot_ms(void) {

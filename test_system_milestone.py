@@ -10,8 +10,8 @@ import sys
 import tempfile
 
 
-ROOT = Path(__file__).resolve().parents[2]
-VM = ROOT / "util/9vm/9vm"
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
+VM = Path(__file__).resolve().parent / "9vm"
 KERNEL = ROOT / "build/harvey.32bit"
 SOURCE_IMAGE = ROOT / "build/aspera-desktop-gefs.img"
 

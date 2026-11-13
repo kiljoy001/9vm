@@ -8,7 +8,7 @@ build_libmonocypher.py must run first (or alongside this script).
 import os
 import subprocess
 
-REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), "../.."))
+REPO_ROOT = os.path.abspath(os.environ.get("HARVEY", os.path.join(os.path.dirname(__file__), "..", "harvey")))
 SRC_DIR = os.path.join(REPO_ROOT, "sys/src/libtab")
 BUILD_DIR = os.path.join(REPO_ROOT, "build/libtab")
 OUT_LIB = os.path.join(REPO_ROOT, "build/libtab.a")

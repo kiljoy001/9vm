@@ -10,8 +10,8 @@ import subprocess
 import time
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[2]
-VM = ROOT / "util/9vm/9vm"
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
+VM = Path(__file__).resolve().parent / "9vm"
 KERNEL = ROOT / "build/harvey.32bit"
 CMDLINE = "bootargs=local!#9/0 nobootprompt=local O9_HOSTFS_BENCH=1"
 GUEST = re.compile(

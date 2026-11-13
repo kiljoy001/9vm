@@ -9,7 +9,7 @@ import tempfile
 
 from prism import O9_REPO, compile_o9
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 STDLIB = Path(O9_REPO) / "stdlib"
 
 TLS_START = "function IrcDialTLSRaw("
@@ -30,7 +30,7 @@ def main():
         parser.error(f"o9irc source not found: {source}")
     if not (STDLIB / "file.o9").is_file():
         parser.error(f"Objective-9C stdlib not found: {STDLIB}")
-    subprocess.run([sys.executable, str(ROOT / "util/9vm/build_libflate.py")],
+    subprocess.run([sys.executable, str(Path(__file__).resolve().parent / "build_libflate.py")],
                    check=True)
     with tempfile.TemporaryDirectory(prefix="aspera-o9irc-", dir=ROOT / "build") as name:
         stage = Path(name)

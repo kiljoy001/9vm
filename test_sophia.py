@@ -5,10 +5,10 @@ from pathlib import Path
 import subprocess
 import sys
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 SOURCE = ROOT / "sys/src/cmd/o9sophia"
 IMAGE = ROOT / "build/sophia-reboot-test.disk"
-PRISM = ROOT / "util/9vm/prism.py"
+PRISM = Path(__file__).resolve().parent / "prism.py"
 
 
 def guest(name: str, marker: str) -> None:

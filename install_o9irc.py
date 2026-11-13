@@ -10,7 +10,7 @@ import tempfile
 
 from format_gefs_image import Console, SERIAL_INI, ninefat_offset
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(os.environ.get("HARVEY", Path(__file__).resolve().parents[1] / "harvey")).resolve()
 HERE = Path(__file__).resolve().parent
 PROGRAMS = {"o9irc-ircfs": "ircfs", "o9irc-gui": "gui", "o9irc-cli": "irc"}
 
