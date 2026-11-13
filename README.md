@@ -86,8 +86,8 @@ coverage — AHCI or virtio storage, real NICs, VESA/EDID display, PS/2 and USB
 input — not the boot path.
 
 To launch the current GEFS-backed graphical Aspera VM from this checkout, run
-`./bin/aspera check` followed by `./bin/aspera start`. Run
-`./bin/aspera preview` for the host-tree Objective-9C development boot. See
+`$HARVEY/bin/aspera check` followed by `$HARVEY/bin/aspera start`. Run
+`$HARVEY/bin/aspera preview` for the host-tree Objective-9C development boot. See
 [the startup and packaging notes](PACKAGING.md) for the runtime bundle target.
 
 For the full guest, o9c, Aspera, and later bare-metal layout, see
@@ -268,7 +268,7 @@ file before rebooting into a verification pass:
 
 ```sh
 python3 build_kernel.py
-./bin/aspera verify
+$HARVEY/bin/aspera verify
 ```
 
 This test covers the current image transport and GEFS service. It is the

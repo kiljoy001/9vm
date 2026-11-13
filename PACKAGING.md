@@ -6,8 +6,8 @@ From this checkout, after building the VM, kernel, Objective-9C libraries,
 and guest GEFS server:
 
 ```sh
-./bin/aspera check
-./bin/aspera start
+$HARVEY/bin/aspera check
+$HARVEY/bin/aspera start
 ```
 
 `start` boots the GEFS-backed Aspera system and opens the same Objective-9C
@@ -40,8 +40,8 @@ The source VM regression for persistent `rc` state and close/reopen is
 The graphical development preview has a separate command:
 
 ```sh
-./bin/aspera preview
-SDL_VIDEODRIVER=dummy ./bin/aspera preview --smoke
+$HARVEY/bin/aspera preview
+SDL_VIDEODRIVER=dummy $HARVEY/bin/aspera preview --smoke
 ```
 
 `preview` compiles `live.o9` and the shelf service to real Plan 9 guest
@@ -61,7 +61,7 @@ done
 python3 build_gefs_guest.py
 python3 build_kernel.py
 make 9vm
-./bin/aspera check
+$HARVEY/bin/aspera check
 ```
 
 Set `O9_REPO` for Objective-9C and pass `--source /path/to/plan9front` to
@@ -86,8 +86,8 @@ desktop, command tools, and managed driver services in 256 MiB.
 Run both required development gates before packaging:
 
 ```sh
-./bin/aspera quality
-./bin/aspera verify
+$HARVEY/bin/aspera quality
+$HARVEY/bin/aspera verify
 ```
 
 The quality command runs unit, property, sanitizer, coverage-guided fuzzing,
