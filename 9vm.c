@@ -2213,7 +2213,15 @@ int main(int argc, char **argv) {
                 uint8_t buf[256];
                 ssize_t n = read(STDIN_FILENO, buf, free_slots < sizeof(buf) ? free_slots : sizeof(buf));
                 for (ssize_t i = 0; i < n; i++) {
-                    uart_rx_buf[uart_rx_tail & (UART_RX_FIFO - 1)] = buf[i];
+                    uint8_t c = buf[i];
+                    /* Raw mode makes the terminal send CR for Enter,
+                     * but the Inferno/Plan 9 serial console expects NL.
+                     * uartrecv() feeds this queue without a CR->NL
+                     * translation (devuart.c calls kbdputc, not
+                     * kbdcr2nl), so the shell would never see the Enter. */
+                    if (c == '\r')
+                        c = '\n';
+                    uart_rx_buf[uart_rx_tail & (UART_RX_FIFO - 1)] = c;
                     uart_rx_tail++;
                 }
             }

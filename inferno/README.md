@@ -70,6 +70,12 @@ gunzip -c root.img.gz > /tmp/9vm-inferno/root.img
 covers the whole disk up front (16 dentries per directory block instead of 4).
 
 ## Boot
+The serial console is interactive on stdin/stdout.  9vm translates a
+terminal Enter (CR) to NL before feeding the guest UART: Purgatorio's
+`uartrecv()` puts console bytes into `kbdq` with `kbdputc()` rather than
+`kbdcr2nl()`, so a raw terminal would otherwise echo the command but the
+shell would never execute it.  `Ctrl-J` (LF) is the workaround on an older
+9vm binary.
 
 Headless (serial console on stdin/stdout):
 
