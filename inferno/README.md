@@ -204,6 +204,32 @@ SSLv2-era RC4/MD5 record layer, good against casual sniffing and no more;
 `runas` just writes `/dev/user`, so the user name is accounting, not
 containment, and the `cpud` allowlist is the real boundary.
 
+### Modern cryptography
+
+The kernel carries Monocypher 4.0.2 as the builtin module `$Mono`:
+XChaCha20-Poly1305, BLAKE2b, X25519 and EdDSA, callable from Dis.  The C
+is the Plan 9 port from `factotum-libtab`, adapted for Inferno's `8c`.
+
+```
+; monotest
+Monocypher 4.0.2
+ok   blake2b abc
+ok   aead ciphertext not plaintext
+ok   aead round trip
+ok   aead tampered tag rejected
+ok   aead tampered ad rejected
+ok   x25519 shared secret
+ok   eddsa sign/verify
+ok   eddsa changed message rejected
+all tests passed
+```
+
+`monotest` checks BLAKE2b against the specification's digest of `abc`, an
+AEAD round trip with tampered tag and associated data, X25519 agreement, and
+EdDSA sign/verify.  `mono(2)` documents the module.  This is the base for
+replacing the SSL device's RC4 in `listen`; it is not wired into the
+authentication path yet.
+
 ## virtio-net
 
 `os/pc/ethervirtio.c` drives 9vm's virtio-net device.  9vm only creates the
