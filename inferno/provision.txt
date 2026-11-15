@@ -3,8 +3,7 @@ cp -r /dis /n
 cp -r /icons /n
 mkdir /n/fonts
 cp -r /fonts/misc /n/fonts/misc
-mkdir /n/lib
-cat /lib/wmsetup > /n/lib/wmsetup
+cp -r /lib /n
 cat /osinit.dis > /n/osinit.dis
 mkdir /n/chan /n/dev /n/env /n/fd /n/n /n/n/remote /n/net /n/nvfs /n/prog
 echo PROVISION-OK

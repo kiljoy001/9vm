@@ -137,15 +137,13 @@ exponential backoff:
 
 ```
 # /n/host/svcd.conf
-cpu	/dis/sh.dis -c 'listen -A tcp!*!6668 /dis/cpud.dis'
+cpu	/dis/sh.dis -c 'listen -a rc4_128 tcp!*!6668 /dis/sh.dis /lib/cpusession.sh'
 ```
 
 ```
-; cat /tmp/svcd/status
-cpu running(group) pid=11 restarts=0
 ; svcctl
 cpu running(group) pid=11 restarts=0
-; rcmd -A tcp!127.0.0.1!6668 echo hello
+; rcmd -e rc4_128 tcp!127.0.0.1!6668 echo hello
 hello
 ; svcctl stop cpu
 ; svcctl start cpu
@@ -158,8 +156,46 @@ shows a service's output and `svcctl ctl` shows svcd's event log.  See
 
 `/dis/cpud.dis` is the CLI-only replacement for `auxi/rstyxd`; it mounts the
 client's namespace, binds its `/dev`, applies `/lib/cpud.conf` and logs the
-session.  `cpu` and `rcmd` are the clients.  The tests here use `-A`
-(no authentication); authenticated `listen` plus factotum is the next step.
+session.  `cpu` and `rcmd` are the clients.
+
+### Authentication
+
+Init runs `certify firstboot` before svcd: it creates a signer key in
+`/keydb/signerkey` and a certificate for the console user in
+`/usr/inferno/keyring/default` if they are missing.  Each machine makes its
+own key, so a provisioned image does not carry a shared secret:
+
+```
+init: loopback 127.0.0.1
+certify: signer key for signer in /keydb/signerkey
+certify: inferno -> /usr/inferno/keyring/default
+```
+
+`listen -a rc4_128` authenticates both ends with those certificates and
+encrypts the session; `-a none` authenticates but leaves the bytes in the
+clear.  The client must name the same algorithm:
+
+```
+; rcmd -e rc4_128 tcp!127.0.0.1!6668 echo boot-authed
+boot-authed
+; rcmd -A tcp!127.0.0.1!6668 echo anon          # no certificate: no session
+```
+
+Make a certificate for another user and the session runs as that name:
+
+```
+; certify user alice
+certify: alice -> /usr/alice/keyring/default
+; rcmd -f /usr/alice/keyring/default -e rc4_128 tcp!127.0.0.1!6668 echo hi
+hi
+; cat /tmp/cpud.log
+start user=alice cmd=echo args=echo hi
+```
+
+A certificate signed by a different signer is refused
+(`pk doesn't match certificate`).  See `certify(8)`, `cpud(8)` and
+`listen(1)`.  The certificate is a bearer token, and `runas` is not a
+containment boundary within one Inferno instance; the `cpud` allowlist is.
 
 ## virtio-net
 
@@ -229,6 +265,10 @@ kernel stacks; `^T^T K` dumps the console queues and the `kbddrops` counter.
 - Services are supervised by liveness, not health: a wedged listener is left
   alone.  There is no dependency ordering, per-user service identity, or
   resource limit yet.
-- Authentication is not wired up.  `cpud`/`rcmd` are exercised with `-A`;
-  the next step is factotum + keyfs on the server and `getauthinfo` on the
-  client, so the same rstyxd port is usable over a network.
+- Certificates are bearer tokens with no expiry and no revocation list.
+  Adding a user means running `certify user` on the server by hand and
+  copying the file to the client out of band.  There is no key directory,
+  no per-user allowlist and no audit beyond `/tmp/cpud.log`.
+- 9vm has no battery-backed clock, so the guest starts at 1970-01-01.
+  Certificates are issued with expiry 0 (never), which is what makes that
+  workable; anything that compares dates inside the VM will be wrong.
