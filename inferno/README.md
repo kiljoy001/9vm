@@ -226,9 +226,23 @@ all tests passed
 
 `monotest` checks BLAKE2b against the specification's digest of `abc`, an
 AEAD round trip with tampered tag and associated data, X25519 agreement, and
-EdDSA sign/verify.  `mono(2)` documents the module.  This is the base for
-replacing the SSL device's RC4 in `listen`; it is not wired into the
-authentication path yet.
+EdDSA sign/verify.  `mono(2)` documents the module.
+
+`listen -a mono`, `rcmd -e mono` and `cpu -C mono` select a Monocypher
+authentication and transport (`monoauth(8)`): EdDSA certificates from
+`certify`, X25519 key exchange, BLAKE2b key derivation and an
+XChaCha20-Poly1305 record stream.  One session works end to end, including
+one run as a second user:
+
+```
+; rcmd -e mono tcp!127.0.0.1!6668 echo mono-ok
+mono-ok
+```
+
+It is **experimental**: a second session on the same listener hangs, because
+mounting and exporting the file-channel descriptor leaks state.  The default
+`svcd.conf` still uses `-a rc4_128`; see `man/8/monoauth` in the purgatorio
+tree for the protocol and the limits.
 
 ## virtio-net
 
