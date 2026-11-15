@@ -128,6 +128,39 @@ mount -A '#~/host' /n/host
 ls /n/host
 ```
 
+## Services
+
+The kernel's init brings up `127.0.0.1`, then starts `/dis/svcd.dis`, the
+service manager.  svcd reads `/lib/svcd.conf` or, when present, the host's
+`/n/host/svcd.conf`; services are restarted when they exit, with an
+exponential backoff:
+
+```
+# /n/host/svcd.conf
+cpu	/dis/sh.dis -c 'listen -A tcp!*!6668 /dis/cpud.dis'
+```
+
+```
+; cat /tmp/svcd/status
+cpu running(group) pid=11 restarts=0
+; svcctl
+cpu running(group) pid=11 restarts=0
+; rcmd -A tcp!127.0.0.1!6668 echo hello
+hello
+; svcctl stop cpu
+; svcctl start cpu
+```
+
+`running(group)` means the service's leader exited but its process group is
+still alive; `listen` daemonises, so this is normal.  `svcctl log NAME`
+shows a service's output and `svcctl ctl` shows svcd's event log.  See
+`svcd(8)` and `svcctl(1)` in the purgatorio tree.
+
+`/dis/cpud.dis` is the CLI-only replacement for `auxi/rstyxd`; it mounts the
+client's namespace, binds its `/dev`, applies `/lib/cpud.conf` and logs the
+session.  `cpu` and `rcmd` are the clients.  The tests here use `-A`
+(no authentication); authenticated `listen` plus factotum is the next step.
+
 ## virtio-net
 
 `os/pc/ethervirtio.c` drives 9vm's virtio-net device.  9vm only creates the
@@ -193,6 +226,9 @@ kernel stacks; `^T^T K` dumps the console queues and the `kbddrops` counter.
 - kfs64 is a simple write-through 9P server: every block write is synchronous
   and every block allocation rewrites the superblock.  It is frozen at
   cheap fixes; host-side storage is the intended way around it.
-- The host tree is not mounted yet.  The next step is the 9ring host transport
-  (`#~/host`), so `/dis`, `/icons` and `/fonts` can be served from the host
-  instead of provisioned into the image.
+- Services are supervised by liveness, not health: a wedged listener is left
+  alone.  There is no dependency ordering, per-user service identity, or
+  resource limit yet.
+- Authentication is not wired up.  `cpud`/`rcmd` are exercised with `-A`;
+  the next step is factotum + keyfs on the server and `getauthinfo` on the
+  client, so the same rstyxd port is usable over a network.
