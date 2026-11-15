@@ -163,7 +163,8 @@ session.  `cpu` and `rcmd` are the clients.
 Init runs `certify firstboot` before svcd: it creates a signer key in
 `/keydb/signerkey` and a certificate for the console user in
 `/usr/inferno/keyring/default` if they are missing.  Each machine makes its
-own key, so a provisioned image does not carry a shared secret:
+own key, so an image cloned **before** first boot carries no shared secret
+(one cloned after it carries the original machine's key):
 
 ```
 init: loopback 127.0.0.1
@@ -193,9 +194,15 @@ start user=alice cmd=echo args=echo hi
 ```
 
 A certificate signed by a different signer is refused
-(`pk doesn't match certificate`).  See `certify(8)`, `cpud(8)` and
-`listen(1)`.  The certificate is a bearer token, and `runas` is not a
-containment boundary within one Inferno instance; the `cpud` allowlist is.
+(`pk doesn't match certificate`), and the user name is inside the signed
+public key, so a certificate cannot be relabelled.  See `certify(8)`,
+`cpud(8)` and `listen(1)`.
+
+What it is not: certificates never expire and cannot be revoked (replacing
+one user's certificate leaves the old one valid); `rc4_128` is Inferno's
+SSLv2-era RC4/MD5 record layer, good against casual sniffing and no more;
+`runas` just writes `/dev/user`, so the user name is accounting, not
+containment, and the `cpud` allowlist is the real boundary.
 
 ## virtio-net
 
