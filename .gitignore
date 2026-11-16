@@ -3,3 +3,4 @@ test_payload.elf
 __pycache__/
 *.pyc
 build/
+inferno/time
