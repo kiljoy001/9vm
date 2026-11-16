@@ -239,10 +239,10 @@ one run as a second user:
 mono-ok
 ```
 
-It is **experimental**: a second session on the same listener hangs, because
-mounting and exporting the file-channel descriptor leaks state.  The default
-`svcd.conf` still uses `-a rc4_128`; see `man/8/monoauth` in the purgatorio
-tree for the protocol and the limits.
+The default `svcd.conf` now selects `-a mono`.  One connection still carries
+one session: the link multiplexes tags, but `listen` does not yet accept more
+than one session per link and `rcmd` opens a fresh link each time.  See
+`man/8/monoauth` in the purgatorio tree for the protocol and the limits.
 
 ## virtio-net
 
