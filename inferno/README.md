@@ -128,6 +128,24 @@ mount -A '#~/host' /n/host
 ls /n/host
 ```
 
+### A relayed 9P server: `#~/ns`
+
+`-ns tcp!host!port` (or `unix!path`) offers the guest a second ring,
+`#~/ns`, whose 9P messages 9vm relays unchanged to that server, so a guest
+without a network reaches a 9P server on the host; the desktop's wada runs
+its Dis apps this way, with its namespace server nsfs at the far end.  The
+server answers in its own order and time (a read may wait), so each request
+stays outstanding until the reply carrying its tag arrives.  9vm connects
+on the first request and again after the connection is lost; a request the
+server never answered gets an Rerror, so the guest sees a failed request,
+never a dead ring, and remounts.  The header's `features` word (offset 8)
+carries `P9_HOST_FEAT_NS`; a kernel without the channel finds `#~/ns`
+refused, and a host without `-ns` leaves the bit clear.
+
+```sh
+mount -A '#~/ns' /n/ns
+```
+
 ## Services
 
 The kernel's init brings up `127.0.0.1`, then starts `/dis/svcd.dis`, the

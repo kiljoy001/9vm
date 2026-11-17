@@ -80,6 +80,8 @@ struct P9Channel {
 #define P9_HOST_MSIZE 32768
 #define P9_HOST_REGION_SIZE (2 * 1024 * 1024)
 #define P9_HOST_DOORBELL_PORT 0x9009
+/* features: what the host offers beyond the host file system's channel */
+#define P9_HOST_FEAT_NS 1U	/* the ns channel, relayed to the 9P server 9vm -ns names */
 typedef struct P9HostBuffer P9HostBuffer;
 struct P9HostBuffer {
 	u8 request[P9_HOST_MSIZE];
@@ -89,8 +91,12 @@ typedef struct P9HostShared P9HostShared;
 struct P9HostShared {
 	u32 magic;
 	u32 version;
+	u32 features;
 	P9Channel channel;
 	P9HostBuffer buffer[P9_HOST_SLOTS];
+	/* the ns channel: the guest's #~/ns, present when features has P9_HOST_FEAT_NS */
+	P9Channel ns;
+	P9HostBuffer nsbuffer[P9_HOST_SLOTS];
 };
 
 /* T-Ring Operations */

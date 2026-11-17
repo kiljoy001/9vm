@@ -12,6 +12,7 @@
 #include <sys/stat.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <netdb.h>
 #include <sys/wait.h>
 #include <poll.h>
 #include <linux/kvm.h>
@@ -215,6 +216,225 @@ static void hostring_stop(void) {
         hostfs_free(hostring_fs);
         free(hostring_fs);
         hostring_fs = NULL;
+    }
+}
+
+/* The ns ring: a second 9P channel the guest reaches as #~/ns, relayed as
+ * raw 9P to the server -ns names, which on the desktop is nsfs, wada's
+ * namespace server.  Unlike hostfs that server answers in its own time
+ * and order (a read may wait for something to happen), so a slot stays
+ * outstanding until the reply carrying its tag arrives; the ring already
+ * completes slots in any order.  The connection is made when the first
+ * request needs it, and again after it is lost, so the server may start
+ * after the VM or restart under it; the guest then remounts. */
+static const char *ns_addr;
+static int ns_fd = -1;
+static pthread_t ns_thread;
+static volatile int ns_running;
+static uint64_t ns_requests;
+static struct { int busy; uint16_t tag; uint16_t oldtag; } ns_out[P9_HOST_SLOTS];
+static uint8_t ns_rbuf[2 * P9_HOST_MSIZE];
+static size_t ns_rlen;
+
+enum { P9_RERROR = 107, P9_TFLUSH = 108, P9_RFLUSH = 109, P9_NOTAG = 0xFFFF };
+
+static int connect_unix_socket(const char *path);
+
+/* Dials unix!/path, tcp!host!port, or a plain socket path. */
+static int ns_dial(const char *addr) {
+    if (strncmp(addr, "unix!", 5) == 0)
+        return connect_unix_socket(addr + 5);
+    if (strncmp(addr, "tcp!", 4) == 0) {
+        const char *host = addr + 4, *port = strchr(host, '!');
+        char name[256];
+        struct addrinfo hints, *res, *ai;
+        int fd = -1;
+        if (port == NULL || (size_t)(port - host) >= sizeof name)
+            return -1;
+        memcpy(name, host, port - host);
+        name[port - host] = '\0';
+        port++;
+        memset(&hints, 0, sizeof hints);
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        if (getaddrinfo(name, port, &hints, &res) != 0)
+            return -1;
+        for (ai = res; ai != NULL; ai = ai->ai_next) {
+            fd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+            if (fd < 0)
+                continue;
+            if (connect(fd, ai->ai_addr, ai->ai_addrlen) == 0)
+                break;
+            close(fd);
+            fd = -1;
+        }
+        freeaddrinfo(res);
+        return fd;
+    }
+    return connect_unix_socket(addr);
+}
+
+/* Completes the slot with msg as its response. */
+static void ns_complete(uint32_t slot, const uint8_t *msg, uint32_t len) {
+    P9HostBuffer *b = &hostring->nsbuffer[slot];
+    P9Comp comp;
+    struct timespec idle = { .tv_sec = 0, .tv_nsec = 50000 };
+    memcpy(b->response, msg, len);
+    memset(&comp, 0, sizeof comp);
+    comp.tag = msg[5] | (msg[6] << 8);
+    comp.type = msg[4];
+    comp.count = len;
+    comp.result = slot;
+    while (__atomic_load_n(&ns_running, __ATOMIC_ACQUIRE) &&
+           p9_rring_complete(&hostring->ns.r_ring, &comp) < 0)
+        nanosleep(&idle, NULL);
+    ns_out[slot].busy = 0;
+    __atomic_fetch_add(&ns_requests, 1, __ATOMIC_RELAXED);
+}
+
+/* Answers the slot's request with an Rerror: the guest sees a failed
+ * request, not a dead ring. */
+static void ns_fail(uint32_t slot, uint16_t tag, const char *why) {
+    uint8_t msg[9 + 255];
+    size_t n = strlen(why);
+    uint32_t len;
+    if (n > 255)
+        n = 255;
+    len = 9 + n;
+    msg[0] = len; msg[1] = len >> 8; msg[2] = len >> 16; msg[3] = len >> 24;
+    msg[4] = P9_RERROR;
+    msg[5] = tag; msg[6] = tag >> 8;
+    msg[7] = n; msg[8] = n >> 8;
+    memcpy(msg + 9, why, n);
+    ns_complete(slot, msg, len);
+}
+
+/* Drops the connection, failing every request it still owed a reply. */
+static void ns_drop(const char *why) {
+    unsigned i;
+    if (ns_fd >= 0) {
+        close(ns_fd);
+        ns_fd = -1;
+    }
+    ns_rlen = 0;
+    for (i = 0; i < P9_HOST_SLOTS; i++)
+        if (ns_out[i].busy)
+            ns_fail(i, ns_out[i].tag, why);
+}
+
+/* A reply from the server completes the slot whose request carries its
+ * tag.  An Rflush ends the flushed request first, as 9P requires the
+ * original's reply, if any, to precede it; a reply to nothing outstanding
+ * is dropped. */
+static void ns_deliver(const uint8_t *msg, uint32_t len) {
+    uint16_t tag = msg[5] | (msg[6] << 8);
+    unsigned i, j;
+    for (i = 0; i < P9_HOST_SLOTS; i++)
+        if (ns_out[i].busy && ns_out[i].tag == tag)
+            break;
+    if (i == P9_HOST_SLOTS)
+        return;
+    if (msg[4] == P9_RFLUSH && ns_out[i].oldtag != P9_NOTAG)
+        for (j = 0; j < P9_HOST_SLOTS; j++)
+            if (ns_out[j].busy && ns_out[j].tag == ns_out[i].oldtag)
+                ns_fail(j, ns_out[j].tag, "flushed");
+    ns_complete(i, msg, len);
+}
+
+static int ns_send(const uint8_t *p, size_t n) {
+    while (n > 0) {
+        ssize_t w = write(ns_fd, p, n);
+        if (w < 0) {
+            if (errno == EINTR)
+                continue;
+            return -1;
+        }
+        p += w;
+        n -= w;
+    }
+    return 0;
+}
+
+static void *ns_serve(void *arg) {
+    P9Slot slot;
+    P9Comp comp;
+    struct timespec idle = { .tv_sec = 0, .tv_nsec = 50000 };
+    struct timespec rest = { .tv_sec = 0, .tv_nsec = 1000000 };
+    (void)arg;
+    while (__atomic_load_n(&ns_running, __ATOMIC_ACQUIRE)) {
+        int worked = 0;
+        while (p9_tring_consume(&hostring->ns.t_ring, &slot)) {
+            P9HostBuffer *b;
+            uint32_t wirelen = 0;
+            worked = 1;
+            if (slot.buf_addr < P9_HOST_SLOTS && slot.count >= 7 && slot.count <= P9_HOST_MSIZE) {
+                b = &hostring->nsbuffer[slot.buf_addr];
+                memcpy(&wirelen, b->request, sizeof wirelen);
+            }
+            if (wirelen != slot.count || b->request[4] != slot.type ||
+                b->request[5] != (uint8_t)slot.tag || b->request[6] != (uint8_t)(slot.tag >> 8)) {
+                memset(&comp, 0, sizeof comp);
+                comp.tag = slot.tag;
+                comp.result = slot.buf_addr;
+                comp.status = 1;
+                while (__atomic_load_n(&ns_running, __ATOMIC_ACQUIRE) &&
+                       p9_rring_complete(&hostring->ns.r_ring, &comp) < 0)
+                    nanosleep(&idle, NULL);
+                continue;
+            }
+            ns_out[slot.buf_addr].busy = 1;
+            ns_out[slot.buf_addr].tag = slot.tag;
+            ns_out[slot.buf_addr].oldtag = slot.type == P9_TFLUSH && slot.count >= 9
+                ? (uint16_t)(b->request[7] | (b->request[8] << 8)) : P9_NOTAG;
+            if (ns_fd < 0 && (ns_fd = ns_dial(ns_addr)) < 0) {
+                ns_fail(slot.buf_addr, slot.tag, "ns: cannot reach the server");
+                continue;
+            }
+            if (ns_send(b->request, slot.count) < 0)
+                ns_drop("ns: connection lost");
+        }
+        if (ns_fd >= 0) {
+            struct pollfd pfd = { .fd = ns_fd, .events = POLLIN, .revents = 0 };
+            if (poll(&pfd, 1, worked ? 0 : 1) > 0) {
+                ssize_t n = read(ns_fd, ns_rbuf + ns_rlen, sizeof ns_rbuf - ns_rlen);
+                if (n > 0) {
+                    ns_rlen += n;
+                    for (;;) {
+                        uint32_t len;
+                        if (ns_rlen < 4)
+                            break;
+                        len = ns_rbuf[0] | ns_rbuf[1] << 8 | ns_rbuf[2] << 16 | (uint32_t)ns_rbuf[3] << 24;
+                        if (len < 7 || len > P9_HOST_MSIZE) {
+                            ns_drop("ns: bad message from the server");
+                            break;
+                        }
+                        if (ns_rlen < len)
+                            break;
+                        ns_deliver(ns_rbuf, len);
+                        memmove(ns_rbuf, ns_rbuf + len, ns_rlen - len);
+                        ns_rlen -= len;
+                    }
+                } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+                    ns_drop("ns: connection closed");
+                }
+            }
+        } else if (!worked) {
+            nanosleep(&rest, NULL);
+        }
+    }
+    return NULL;
+}
+
+static void ns_stop(void) {
+    if (ns_running) {
+        __atomic_store_n(&ns_running, 0, __ATOMIC_RELEASE);
+        pthread_join(ns_thread, NULL);
+        fprintf(stderr, "[9vm] ns 9ring relayed %llu request(s)\n",
+                (unsigned long long)ns_requests);
+    }
+    if (ns_fd >= 0) {
+        close(ns_fd);
+        ns_fd = -1;
     }
 }
 
@@ -1820,6 +2040,8 @@ int main(int argc, char **argv) {
             netfs_explicit = true;
         } else if (strcmp(argv[i], "-net-tap") == 0 && i + 1 < argc) {
             net_tap = argv[++i];
+        } else if (strcmp(argv[i], "-ns") == 0 && i + 1 < argc) {
+            ns_addr = argv[++i];
         } else if (strcmp(argv[i], "-no9ring") == 0) {
             use_hostring = false;
         } else if (strcmp(argv[i], "-t") == 0 && i + 1 < argc) {
@@ -1830,7 +2052,7 @@ int main(int argc, char **argv) {
     }
 
     if (!kernel_path) {
-        fprintf(stderr, "Usage: %s [-m <mb>] [-c <cmdline>] [-r <root>] [-boot <guest>] [-display-shm <name>] [-display-root <dir>] [-netfs <sock>] [-net-tap <if>] [-gefs-image <image>] [-initrd <file>] [-disk <image>] [-legacy-host-root] [-no9ring] <kernel-elf>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-m <mb>] [-c <cmdline>] [-r <root>] [-boot <guest>] [-display-shm <name>] [-display-root <dir>] [-netfs <sock>] [-net-tap <if>] [-ns <tcp!host!port|unix!path>] [-gefs-image <image>] [-initrd <file>] [-disk <image>] [-legacy-host-root] [-no9ring] <kernel-elf>\n", argv[0]);
         return 1;
     }
     isolated_gefs_root = gefs_image != NULL && boot_override == NULL && !legacy_host_root;
@@ -2094,6 +2316,21 @@ int main(int argc, char **argv) {
         fprintf(stderr, "[9vm] Shared host 9ring at guest physical 0x%zx\n",
                 ram_size - P9_HOST_REGION_SIZE);
     }
+    if (ns_addr != NULL) {
+        if (!use_hostring) {
+            fprintf(stderr, "[9vm] -ns needs the shared 9ring; ns channel not offered\n");
+        } else {
+            hostring->features |= P9_HOST_FEAT_NS;
+            __atomic_store_n(&ns_running, 1, __ATOMIC_RELEASE);
+            if (pthread_create(&ns_thread, NULL, ns_serve, NULL) != 0) {
+                perror("[9vm] ns thread");
+                ns_running = 0;
+                hostring->features &= ~P9_HOST_FEAT_NS;
+            } else {
+                fprintf(stderr, "[9vm] ns 9ring relayed to '%s'\n", ns_addr);
+            }
+        }
+    }
 
     uint32_t initrd_pa = 0, initrd_len = 0;
     if (initrd_path != NULL) {
@@ -2267,6 +2504,7 @@ int main(int argc, char **argv) {
                     uart_scr = *data;
                 } else if (run->io.port == 0xF4) {
                     fprintf(stderr, "\n[9vm] Guest requested shutdown.\n");
+                    ns_stop();
                     hostring_stop();
                     hostfs_free(&hostfs_inst);
                     if (diskfs_inst != NULL) { hostfs_free(diskfs_inst); free(diskfs_inst); }
@@ -2385,6 +2623,7 @@ int main(int argc, char **argv) {
         }
     }
 
+    ns_stop();
     hostring_stop();
     hostfs_free(&hostfs_inst);
     if (diskfs_inst != NULL) { hostfs_free(diskfs_inst); free(diskfs_inst); }
