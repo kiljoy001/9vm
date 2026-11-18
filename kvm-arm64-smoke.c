@@ -4,6 +4,9 @@
  * Creates a VM and one vCPU, puts one page of code at 0x40000000, runs
  * PSCI SYSTEM_OFF, and expects KVM_EXIT_SYSTEM_EVENT/SHUTDOWN.
  *
+ * The vCPU must opt into PSCI (KVM_ARM_VCPU_PSCI_0_2); with features=0
+ * the HVC is not a PSCI call and the vCPU never comes back.
+ *
  * Build on the ARM64 host:
  *   cc -O2 -Wall -o kvm-arm64-smoke kvm-arm64-smoke.c
  *   ./kvm-arm64-smoke
@@ -65,14 +68,14 @@ int main(void)
         die("mmap guest");
 
     /*
-     * 0x00: ldr x0, #8       ; load PSCI_SYSTEM_OFF
-     * 0x04: hvc #0           ; PSCI call
-     * 0x08: .quad 0x84000008
+     * x0 is set from the host, so the whole guest is one call.  The
+     * branch keeps the vCPU parked if the call ever returns instead of
+     * running into whatever bytes follow.
+     *
+     * 0x00: hvc #0       ; PSCI call, x0 = 0x84000008 (SYSTEM_OFF)
+     * 0x04: b .          ; never reached on a working PSCI
      */
-    const uint32_t code[] = {
-        0x58000040, 0xd4000002, 0x00000000, 0x00000000,
-        0x84000008, 0x00000000,
-    };
+    const uint32_t code[] = { 0xd4000002, 0x14000000 };
     memcpy(guest, code, sizeof code);
 
     struct kvm_userspace_memory_region memory = {
@@ -90,6 +93,14 @@ int main(void)
     if (ioctl(vm, KVM_ARM_PREFERRED_TARGET, &init) < 0)
         die("KVM_ARM_PREFERRED_TARGET");
 
+    /*
+     * PSCI is not on by default on every kernel: without this bit the
+     * HVC below is not a PSCI call, the guest runs off into the data
+     * that follows it, and KVM_RUN never returns.
+     */
+    if (ioctl(kvm, KVM_CHECK_EXTENSION, KVM_CAP_ARM_PSCI_0_2) > 0)
+        init.features[0] |= (1u << KVM_ARM_VCPU_PSCI_0_2);
+
     int vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
     if (vcpu < 0)
         die("KVM_CREATE_VCPU");
@@ -106,6 +117,7 @@ int main(void)
 
     set_reg(vcpu, CORE_REG(regs.pc), GUEST_ADDR);
     set_reg(vcpu, CORE_REG(regs.pstate), 0x3c5); /* EL1h, DAIF masked */
+    set_reg(vcpu, CORE_REG(regs.regs[0]), 0x84000008ULL); /* PSCI_SYSTEM_OFF */
 
     if (ioctl(vcpu, KVM_RUN, 0) < 0)
         die("KVM_RUN");

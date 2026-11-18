@@ -13,7 +13,15 @@ test_payload.elf: test_payload.S
 kvm-arm64-smoke: kvm-arm64-smoke.c
 	$(CC) $(CFLAGS) -o $@ $<
 
+# Host-side board layer; builds and runs only on an ARM64 host with KVM
+# (the ARM ioctls are absent from x86 headers), so it is not in `all`.
+9vm-arm64: 9vm-arm64.c
+	$(CC) $(CFLAGS) -o $@ $<
+
+kvm-arm64-probe: kvm-arm64-probe.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f 9vm test_payload.elf kvm-arm64-smoke
+	rm -f 9vm test_payload.elf kvm-arm64-smoke 9vm-arm64 kvm-arm64-probe
 
 .PHONY: all clean
