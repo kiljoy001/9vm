@@ -35,6 +35,8 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "hostfs.h"
+
 #define RAM_BASE        0x40000000UL
 #define KERNEL_PA       0x40080000UL
 #define DTB_PA          0x48000000UL
@@ -402,6 +404,7 @@ struct uart {
 };
 
 static struct uart uart;
+static struct hostfs hostfs_inst;
 static int vm_fd = -1;
 static int tty_raw_set;
 static struct termios tty_orig;
@@ -639,6 +642,271 @@ setup_vgic(int vm)
 		die("KVM_DEV_ARM_VGIC_CTRL_INIT");
 }
 
+
+/* ---- virtio-9p over virtio-mmio (v2 registers, as the guest #9 driver) ---- */
+
+#define V9_MAGIC	0x74726976
+#define V9_DEVICE	9		/* Typ9p */
+#define V9_VERSION	2
+#define V9_QSIZE	64
+
+enum {
+	Vmagic = 0x000, Vversion = 0x004, Vdevice = 0x008,
+	Vdevfeatures = 0x010, Vdevselect = 0x014,
+	Vdrvfeatures = 0x020, Vdrvselect = 0x024,
+	Vqueuesel = 0x030, Vqueuemax = 0x034, Vqueuenum = 0x038,
+	Vqueueready = 0x044,
+	Vnotify = 0x050, Vinterrupt = 0x060, Vinterruptack = 0x064,
+	Vstatus = 0x070,
+	Vdescaddr = 0x080, Vavailaddr = 0x090, Vusedaddr = 0x0a0,
+	Vconfigbase = 0x100,
+};
+
+struct v9 {
+	uint8_t bar0[0x1000];
+	uint8_t *ram;
+	uint64_t ram_size;
+	struct hostfs *hostfs;
+	uint32_t irq;
+	uint64_t bar;
+	uint16_t last_avail;
+	int irq_level;
+};
+
+static struct v9 v9dev;
+
+static uint32_t
+v9_u32(int off)
+{
+	uint32_t v;
+
+	memcpy(&v, v9dev.bar0 + off, 4);
+	return v;
+}
+
+static uint64_t
+v9_u64(int off)
+{
+	uint64_t v;
+
+	memcpy(&v, v9dev.bar0 + off, 8);
+	return v;
+}
+
+static void
+v9_put16(int off, uint16_t v)
+{
+	memcpy(v9dev.bar0 + off, &v, 2);
+}
+
+static void
+v9_put32(int off, uint32_t v)
+{
+	memcpy(v9dev.bar0 + off, &v, 4);
+}
+
+static void
+v9_irq(int level)
+{
+	struct kvm_irq_level irq = { .irq = v9dev.irq, .level = (uint32_t)level };
+
+	if(level == v9dev.irq_level)
+		return;
+	if(ioctl(vm_fd, KVM_IRQ_LINE, &irq) == 0)
+		v9dev.irq_level = level;
+}
+
+static void
+v9_init(const char *tag, uint32_t irq, uint64_t bar, struct hostfs *fs,
+        uint8_t *ram, uint64_t ram_size)
+{
+	size_t n = strlen(tag);
+
+	memset(&v9dev, 0, sizeof v9dev);
+	v9dev.hostfs = fs;
+	v9dev.ram = ram;
+	v9dev.ram_size = ram_size;
+	v9dev.irq = irq;
+	v9dev.bar = bar;
+	v9_put32(Vmagic, V9_MAGIC);
+	v9_put32(Vversion, V9_VERSION);
+	v9_put32(Vdevice, V9_DEVICE);
+	v9_put32(Vqueuemax, V9_QSIZE);
+	/* feature 0: mount tag; feature 32 (sel 1 bit 0): VIRTIO_F_VERSION_1 */
+	v9_put32(Vdevfeatures, 1);
+	if(n > 64)
+		n = 64;
+	v9_put16(Vconfigbase, (uint16_t)n);
+	memcpy(v9dev.bar0 + Vconfigbase + 2, tag, n);
+}
+
+/* Guest physical addresses start at RAM_BASE here, not at zero. */
+static uint8_t *
+v9_at(uint64_t gpa)
+{
+	return v9dev.ram + (gpa - RAM_BASE);
+}
+
+static int
+v9_range(uint64_t addr, uint64_t len, uint64_t ram_size)
+{
+	if(len == 0 || addr < RAM_BASE || len > ram_size)
+		return 0;
+	if(addr - RAM_BASE > ram_size - len)
+		return 0;
+	return 1;
+}
+
+static void
+v9_notify(void)
+{
+	uint64_t desc = v9_u64(Vdescaddr);
+	uint64_t avail = v9_u64(Vavailaddr);
+	uint64_t used = v9_u64(Vusedaddr);
+	uint16_t qsize = (uint16_t)v9_u32(Vqueuenum);
+	uint16_t avail_idx;
+	int did = 0;
+
+	if(v9dev.hostfs == NULL || qsize == 0 || qsize > 1024)
+		return;
+	if(!v9_range(desc, (uint64_t)qsize * 16, v9dev.ram_size) ||
+	   !v9_range(avail, 4 + (uint64_t)qsize * 2 + 2, v9dev.ram_size) ||
+	   !v9_range(used, 4 + (uint64_t)qsize * 8 + 2, v9dev.ram_size))
+		return;
+
+	avail_idx = *(uint16_t *)(v9_at(avail) + 2);
+	while(v9dev.last_avail != avail_idx){
+		uint16_t slot = v9dev.last_avail % qsize;
+		uint16_t head = *(uint16_t *)(v9_at(avail) + 4 + slot * 2);
+		uint8_t *req = NULL, *resp = NULL;
+		uint32_t req_len = 0, resp_max = 0, resp_len = 0;
+		uint16_t d = head;
+		int ok = 1;
+
+		v9dev.last_avail++;
+		if(head >= qsize)
+			continue;
+		for(uint16_t i = 0; i < qsize; i++){
+			uint64_t a;
+			uint32_t l;
+			uint16_t flags, next;
+
+			memcpy(&a, v9_at(desc) + (uint64_t)d * 16, 8);
+			memcpy(&l, v9_at(desc) + (uint64_t)d * 16 + 8, 4);
+			memcpy(&flags, v9_at(desc) + (uint64_t)d * 16 + 12, 2);
+			memcpy(&next, v9_at(desc) + (uint64_t)d * 16 + 14, 2);
+			if(!v9_range(a, l, v9dev.ram_size)){
+				ok = 0;
+				break;
+			}
+			if(flags & 2){	/* VRING_DESC_F_WRITE */
+				resp = v9_at(a);
+				resp_max = l;
+			} else {
+				req = v9_at(a);
+				req_len = l;
+			}
+			if((flags & 1) == 0)
+				break;
+			d = next;
+		}
+		if(ok && req != NULL && resp != NULL && req_len >= 7 && resp_max >= 7)
+			resp_len = hostfs_dispatch(v9dev.hostfs, req, req_len, resp, resp_max);
+		else if(ok && resp != NULL && resp_max >= 7){
+			/* Rlerror for a chain we could not parse */
+			resp[0] = 7;
+			resp[1] = 0;
+			resp[4] = (uint8_t)(req != NULL && req_len ? req[4] : 0);
+			resp[5] = (uint8_t)(req != NULL && req_len ? req[5] : 0);
+			resp[6] = 5;	/* EIO */
+			resp_len = 7;
+		}
+
+		{
+			uint16_t used_idx = *(uint16_t *)(v9_at(used) + 2);
+			uint16_t uslot = used_idx % qsize;
+
+			*(uint32_t *)(v9_at(used) + 4 + uslot * 8) = head;
+			*(uint32_t *)(v9_at(used) + 4 + uslot * 8 + 4) = resp_len;
+			__sync_synchronize();
+			*(uint16_t *)(v9_at(used) + 2) = used_idx + 1;
+		}
+		did = 1;
+	}
+	if(did){
+		if(getenv("VM_TRACE"))
+			fprintf(stderr, "[9vm-arm64] 9p reply, raising irq %u (used idx now %u)\n",
+			        v9dev.irq, *(uint16_t *)(v9_at(used) + 2));
+		v9dev.bar0[Vinterrupt] |= 1;
+		v9_irq(1);
+	}
+}
+
+static void
+v9_mmio_write(uint64_t off, const uint8_t *data, uint32_t len)
+{
+	uint32_t v = 0;
+
+	if(off + len > sizeof v9dev.bar0)
+		return;
+	memcpy(v9dev.bar0 + off, data, len);
+	for(uint32_t i = 0; i < len && i < 4; i++)
+		v |= (uint32_t)data[i] << (8 * i);
+
+	switch(off){
+	case Vstatus:
+		if((v & 0xff) == 0){
+			v9dev.last_avail = 0;
+			v9dev.bar0[Vinterrupt] = 0;
+			v9_irq(0);
+		}
+		break;
+	case Vnotify:
+		if(getenv("VM_TRACE"))
+			fprintf(stderr, "[9vm-arm64] notify: qnum=%u desc=0x%llx avail=0x%llx used=0x%llx\n",
+			        v9_u32(Vqueuenum), (unsigned long long)v9_u64(Vdescaddr),
+			        (unsigned long long)v9_u64(Vavailaddr),
+			        (unsigned long long)v9_u64(Vusedaddr));
+		v9_notify();
+		break;
+	case Vinterruptack:
+		v9dev.bar0[Vinterrupt] &= (uint8_t)~v;
+		if(v9dev.bar0[Vinterrupt] == 0)
+			v9_irq(0);
+		break;
+	case Vdevselect:
+	case Vdrvselect:
+		break;
+	case Vdevfeatures:
+		/* sel 1 carries the high word; only bit 32 is offered */
+		if(v9_u32(Vdevselect) == 1)
+			v9_put32(Vdevfeatures, 1);
+		else
+			v9_put32(Vdevfeatures, 1);
+		break;
+	default:
+		break;
+	}
+}
+
+static void
+v9_mmio_read(uint64_t off, uint8_t *data, uint32_t len)
+{
+	if(off + len > sizeof v9dev.bar0){
+		memset(data, 0, len);
+		return;
+	}
+	if(off == Vdevfeatures){
+		uint32_t v = v9_u32(Vdevselect) == 1 ? 1 : 1;
+
+		memcpy(data, &v, len < 4 ? len : 4);
+		if(len > 4)
+			memset(data + 4, 0, len - 4);
+		return;
+	}
+	memcpy(data, v9dev.bar0 + off, len);
+}
+
 /* ---- console input ---- */
 
 static void
@@ -691,6 +959,8 @@ main(int argc, char **argv)
 	const char *kernel = NULL;
 	const char *cmdline = DEFAULT_CMDLINE;
 	const char *dtb_out = NULL;
+	const char *root_dir = ".";
+	const char *tag = "host9p";
 	uint64_t ram_size;
 	size_t ram_mb = DEFAULT_RAM_MB;
 	uint8_t *ram, *dtb;
@@ -705,16 +975,20 @@ main(int argc, char **argv)
 			cmdline = argv[++i];
 		else if(strcmp(argv[i], "-dump-dtb") == 0 && i + 1 < argc)
 			dtb_out = argv[++i];
+		else if(strcmp(argv[i], "-r") == 0 && i + 1 < argc)
+			root_dir = argv[++i];
+		else if(strcmp(argv[i], "-tag") == 0 && i + 1 < argc)
+			tag = argv[++i];
 		else if(argv[i][0] != '-' && kernel == NULL)
 			kernel = argv[i];
 		else {
-			fprintf(stderr, "usage: %s [-m MB] [-c cmdline] [-dump-dtb file] <kernel.img|kernel.elf>\n",
+			fprintf(stderr, "usage: %s [-m MB] [-c cmdline] [-r root] [-tag name] [-dump-dtb file] <kernel.img|kernel.elf>\n",
 			        argv[0]);
 			return 2;
 		}
 	}
 	if(kernel == NULL){
-		fprintf(stderr, "usage: %s [-m MB] [-c cmdline] <kernel.img|kernel.elf>\n", argv[0]);
+		fprintf(stderr, "usage: %s [-m MB] [-c cmdline] [-r root] <kernel.img|kernel.elf>\n", argv[0]);
 		return 2;
 	}
 
@@ -751,6 +1025,17 @@ main(int argc, char **argv)
 	}
 
 	entry = load_image(kernel, ram, ram_size);
+
+	{
+		char real[PATH_MAX];
+
+		if(realpath(root_dir, real) == NULL || strcmp(real, "/") == 0){
+			fprintf(stderr, "[9vm-arm64] refusing to export host root '/'; pass -r DIR\n");
+			return 1;
+		}
+		hostfs_init(&hostfs_inst, real);
+		fprintf(stderr, "[9vm-arm64] hostfs '%s' as virtio-9p tag '%s'\n", real, tag);
+	}
 
 	kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
 	if(kvm < 0){
@@ -800,12 +1085,21 @@ main(int argc, char **argv)
 	if(run == MAP_FAILED)
 		die("mmap kvm_run");
 
+	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
+	        ram, ram_size);
+
 	set_one_reg(vcpu,
 	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
 	                KVM_REG_ARM_CORE_REG(regs.pc), entry);
+	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
+	        ram, ram_size);
+
 	set_one_reg(vcpu,
 	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
 	                KVM_REG_ARM_CORE_REG(regs.regs[0]), dtb_pa);
+	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
+	        ram, ram_size);
+
 	set_one_reg(vcpu,
 	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
 	                KVM_REG_ARM_CORE_REG(regs.pstate), 0x3c5);
@@ -864,9 +1158,23 @@ main(int argc, char **argv)
 				}
 				break;
 			}
+			if(pa >= VIRTIO_MMIO_BASE &&
+			   pa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS){
+				uint64_t slot = (pa - VIRTIO_MMIO_BASE) / VIRTIO_MMIO_STRIDE;
+
+				if(slot == 0){
+					uint64_t off = pa - VIRTIO_MMIO_BASE;
+
+					if(run->mmio.is_write)
+						v9_mmio_write(off, run->mmio.data, len);
+					else
+						v9_mmio_read(off, run->mmio.data, len);
+					break;
+				}
+			}
 			if(!run->mmio.is_write)
 				memset(run->mmio.data, 0, len);
-			else
+			else if(getenv("VM_TRACE"))
 				fprintf(stderr, "\n[9vm-arm64] unhandled MMIO write 0x%llx len %u\n",
 				        (unsigned long long)pa, len);
 			break;

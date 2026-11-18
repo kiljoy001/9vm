@@ -173,3 +173,39 @@ should behave the same in both packages. The bare-metal drivers, boot path,
 and Aspera display/input integration are future work. The present named `#~`
 registry restricts a service to processes with the same Plan 9 user name; it
 is not a complete multi-user authorization system.
+
+## ARM64 board layer (`9vm-arm64`)
+
+`9vm.c` is the x86 board: PCI config I/O, a 16550 on port 0x3F8,
+multiboot, ACPI.  `9vm-arm64.c` is the same microVM on an ARM64 host
+with KVM, and deliberately mirrors QEMU `virt` so the *same*
+`build/arm64-kernel/harvey.img` boots under either:
+
+| | |
+|---|---|
+| RAM | 0x40000000, size from `-m` |
+| Image | 0x40080000 (raw Image or ELF at `p_paddr`) |
+| device tree | 0x48000000, passed in `x0`, reserved in `/memreserve/` |
+| console | PL011 at 0x09000000, SPI 1 |
+| interrupt controller | GICv3, distributor 0x08000000, redistributor 0x080A0000 |
+| virtio | eight virtio-mmio transports from 0x0a000000, SPIs 16.. |
+| shutdown | PSCI over HVC (KVM exits with `KVM_EXIT_SYSTEM_EVENT`) |
+
+The board builds its own device tree in C.  Host files are exported
+with `-r DIR` as the virtio-9P tag `host9p` (the guest's `#9/0`) using
+the same `hostfs.c` as the x86 runner.  Console input is queued from
+stdin on a 20 ms `SIGALRM` tick and injected as the PL011 SPI.
+
+Three KVM details cost the most time and are worth remembering:
+
+* PSCI must be enabled with `KVM_ARM_VCPU_PSCI_0_2`; with `features=0`
+  the guest's `hvc` is not a PSCI call and `KVM_RUN` never returns.
+* `KVM_SET_DEVICE_ATTR` is a **device** ioctl (the fd from
+  `KVM_CREATE_DEVICE`), not a VM ioctl.
+* The vCPU must exist before the vGIC is initialised, or this kernel
+  answers `EBUSY` to `KVM_CREATE_VCPU`.
+
+On an Orange Pi 5 Plus (RK3588, 6.1 vendor kernel, VHE + GICv3) the
+kernel passes every self-test, the virtio-9P framing and version
+exchange (`HARVEY-ARM64 VIRTIO-9P PASS`), and reaches an interactive
+`rc` prompt on the emulated PL011.
