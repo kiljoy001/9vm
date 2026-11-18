@@ -21,6 +21,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <linux/kvm.h>
+#include <poll.h>
+#include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
 #include <stddef.h>
@@ -45,7 +47,8 @@
 #define GICD_BASE       0x08000000UL
 #define GICD_SIZE       0x10000UL
 #define GICR_BASE       0x080A0000UL
-#define GICR_SIZE       0x20000UL       /* one vCPU: 2 * 64 KiB */
+#define GICR_CPU        0x20000UL       /* two 64 KiB frames per vCPU */
+#define MAX_CPUS        8
 
 #define UART_BASE       0x09000000UL
 #define UART_SIZE       0x1000UL
@@ -219,8 +222,9 @@ fdt_prop_cells(struct fdt *f, const char *name, const uint32_t *cells, int n)
 #define PHANDLE_CPU  0x8001
 
 static void
-build_fdt(uint8_t *dtb, uint64_t ram_size, const char *cmdline)
+build_fdt(uint8_t *dtb, uint64_t ram_size, const char *cmdline, int ncpu)
 {
+	uint64_t gicr_size = (uint64_t)GICR_CPU * (uint64_t)ncpu;
 	struct fdt f;
 	uint32_t mem[4], gic[8], timer[12];
 	const char *psci_compat[] = { "arm,psci-1.0", "arm,psci-0.2", "arm,psci" };
@@ -263,12 +267,18 @@ build_fdt(uint8_t *dtb, uint64_t ram_size, const char *cmdline)
 	fdt_begin(&f, "cpus");
 	fdt_prop_u32(&f, "#address-cells", 1);
 	fdt_prop_u32(&f, "#size-cells", 0);
-	fdt_begin(&f, "cpu@0");
-	fdt_prop_str(&f, "device_type", "cpu");
-	fdt_prop_str(&f, "compatible", "arm,cortex-a57");
-	fdt_prop_u32(&f, "reg", 0);
-	fdt_prop_u32(&f, "phandle", PHANDLE_CPU);
-	fdt_end(&f);
+	for(int i = 0; i < ncpu; i++){
+		char name[16];
+
+		snprintf(name, sizeof name, "cpu@%d", i);
+		fdt_begin(&f, name);
+		fdt_prop_str(&f, "device_type", "cpu");
+		fdt_prop_str(&f, "compatible", "arm,cortex-a57");
+		fdt_prop_u32(&f, "reg", (uint32_t)i);
+		fdt_prop_str(&f, "enable-method", "psci");
+		fdt_prop_u32(&f, "phandle", PHANDLE_CPU + (uint32_t)i);
+		fdt_end(&f);
+	}
 	fdt_end(&f);
 
 	/* psci */
@@ -294,8 +304,8 @@ build_fdt(uint8_t *dtb, uint64_t ram_size, const char *cmdline)
 	gic[3] = GICD_SIZE;
 	gic[4] = 0;
 	gic[5] = (uint32_t)GICR_BASE;
-	gic[6] = 0;
-	gic[7] = GICR_SIZE;
+	gic[6] = (uint32_t)(gicr_size >> 32);
+	gic[7] = (uint32_t)gicr_size;
 	fdt_prop_cells(&f, "reg", gic, 8);
 	fdt_end(&f);
 
@@ -406,6 +416,7 @@ struct uart {
 static struct uart uart;
 static struct hostfs hostfs_inst;
 static int vm_fd = -1;
+static pthread_mutex_t devlock = PTHREAD_MUTEX_INITIALIZER;
 static int tty_raw_set;
 static struct termios tty_orig;
 static volatile sig_atomic_t running = 1;
@@ -588,6 +599,18 @@ die(const char *what)
 {
 	fprintf(stderr, "[9vm-arm64] %s: %s\n", what, strerror(errno));
 	exit(1);
+}
+
+#define CORE_REG(name) \
+	(KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE | \
+	 KVM_REG_ARM_CORE_REG(name))
+
+static int
+get_one_reg(int vcpu, unsigned long id, uint64_t *v)
+{
+	struct kvm_one_reg reg = { .id = id, .addr = (uint64_t)(uintptr_t)v };
+
+	return ioctl(vcpu, KVM_GET_ONE_REG, &reg);
 }
 
 static void
@@ -916,17 +939,47 @@ tty_restore(void)
 		tcsetattr(STDIN_FILENO, TCSANOW, &tty_orig);
 }
 
-static void
-on_alarm(int sig)
-{
-	(void)sig;
-}
+static int stop_pipe[2] = { -1, -1 };
+
+static void poll_stdin(void);
 
 static void
 on_signal(int sig)
 {
 	(void)sig;
 	running = 0;
+	if(stop_pipe[1] >= 0)
+		(void)!write(stop_pipe[1], "x", 1);
+}
+
+/*
+ * Console input gets its own thread.  A process-directed timer signal
+ * can land on a thread that is not in KVM_RUN (the joining thread), so
+ * the old SIGALRM tick stopped delivering input as soon as the VM had
+ * more than one vCPU.
+ */
+static void *
+stdin_thread(void *arg)
+{
+	struct pollfd p[2] = {
+		{ .fd = STDIN_FILENO, .events = POLLIN },
+		{ .fd = stop_pipe[0], .events = POLLIN },
+	};
+
+	(void)arg;
+	while(running){
+		if(poll(p, 2, 200) <= 0)
+			continue;
+		if(p[1].revents & POLLIN)
+			break;
+		if(p[0].revents & POLLIN){
+			pthread_mutex_lock(&devlock);
+			poll_stdin();
+			pthread_mutex_unlock(&devlock);
+		}
+	}
+	fflush(stdout);
+	exit(0);
 }
 
 static void
@@ -953,6 +1006,136 @@ poll_stdin(void)
 
 /* ---- main ---- */
 
+struct vcpu_ctx {
+	int fd;
+	struct kvm_run *run;
+	int idx;
+};
+
+static struct vcpu_ctx vcs[MAX_CPUS];
+
+static void handle_exit(struct vcpu_ctx *c);
+
+static void *
+vcpu_thread(void *arg)
+{
+	struct vcpu_ctx *c = arg;
+
+	if(c->idx != 0){
+		/*
+		 * A secondary must not be run before the guest's PSCI
+		 * CPU_ON: KVM counts a vCPU that has run as already on,
+		 * and the call then fails with ALREADY_ON.  CPU_ON writes
+		 * the target's PC, so wait for it to become non-zero.
+		 */
+		while(running){
+			uint64_t pc = 0;
+
+			if(get_one_reg(c->fd, CORE_REG(regs.pc), &pc) == 0 && pc != 0)
+				break;
+			usleep(2000);
+		}
+		if(!running)
+			return NULL;
+	}
+
+	while(running){
+		if(ioctl(c->fd, KVM_RUN, 0) < 0){
+			if(errno == EINTR)
+				continue;
+			if(!running)
+				break;
+			fprintf(stderr, "[9vm-arm64] KVM_RUN cpu%d: %s\n",
+			        c->idx, strerror(errno));
+			running = 0;
+			break;
+		}
+		pthread_mutex_lock(&devlock);
+		handle_exit(c);
+		pthread_mutex_unlock(&devlock);
+	}
+	return NULL;
+}
+
+static void
+handle_exit(struct vcpu_ctx *c)
+{
+	struct kvm_run *run = c->run;
+
+	switch(run->exit_reason){
+	case KVM_EXIT_MMIO: {
+		uint64_t pa = run->mmio.phys_addr;
+		uint32_t len = run->mmio.len;
+
+		if(pa >= UART_BASE && pa < UART_BASE + UART_SIZE){
+			uint32_t off = (uint32_t)(pa - UART_BASE);
+			uint32_t v = 0;
+
+			if(run->mmio.is_write){
+				for(uint32_t i = 0; i < len; i++)
+					v |= (uint32_t)run->mmio.data[i] << (8 * i);
+				uart_write(off, v);
+			} else {
+				v = uart_read(off);
+				for(uint32_t i = 0; i < len; i++)
+					run->mmio.data[i] = (uint8_t)(v >> (8 * i));
+			}
+			return;
+		}
+		if(pa >= VIRTIO_MMIO_BASE &&
+		   pa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS){
+			uint64_t slot = (pa - VIRTIO_MMIO_BASE) / VIRTIO_MMIO_STRIDE;
+
+			if(slot == 0){
+				uint64_t off = pa - VIRTIO_MMIO_BASE;
+
+				if(run->mmio.is_write)
+					v9_mmio_write(off, run->mmio.data, len);
+				else
+					v9_mmio_read(off, run->mmio.data, len);
+				return;
+			}
+		}
+		if(!run->mmio.is_write)
+			memset(run->mmio.data, 0, len);
+		else if(getenv("VM_TRACE"))
+			fprintf(stderr, "\n[9vm-arm64] unhandled MMIO write 0x%llx len %u\n",
+			        (unsigned long long)pa, len);
+		return;
+	}
+	case KVM_EXIT_SYSTEM_EVENT:
+		fprintf(stderr, "\n[9vm-arm64] guest shutdown (type %u)\n",
+		        run->system_event.type);
+		fflush(stdout);
+		exit(0);
+#ifdef KVM_EXIT_ARM_NISV
+	case KVM_EXIT_ARM_NISV:
+		fprintf(stderr, "\n[9vm-arm64] unhandled guest fault at 0x%llx esr 0x%llx\n",
+		        (unsigned long long)run->arm_nisv.fault_ipa,
+		        (unsigned long long)run->arm_nisv.esr_iss);
+		fflush(stdout);
+		exit(1);
+#endif
+	case KVM_EXIT_FAIL_ENTRY:
+		fprintf(stderr, "\n[9vm-arm64] hardware entry failure 0x%llx\n",
+		        (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
+		fflush(stdout);
+		exit(1);
+	case KVM_EXIT_INTERNAL_ERROR:
+		fprintf(stderr, "\n[9vm-arm64] internal error %u\n", run->internal.suberror);
+		fflush(stdout);
+		exit(1);
+	case KVM_EXIT_SHUTDOWN:
+		fprintf(stderr, "\n[9vm-arm64] guest reset/shutdown\n");
+		fflush(stdout);
+		exit(0);
+	default:
+		fprintf(stderr, "\n[9vm-arm64] exit reason %u\n", run->exit_reason);
+		fflush(stdout);
+		exit(1);
+	}
+}
+
 int
 main(int argc, char **argv)
 {
@@ -965,12 +1148,14 @@ main(int argc, char **argv)
 	size_t ram_mb = DEFAULT_RAM_MB;
 	uint8_t *ram, *dtb;
 	uint64_t entry, dtb_pa = DTB_PA;
-	int kvm, vm, vcpu, run_size;
-	struct kvm_run *run;
+	int ncpu = 1;
+	int kvm, vm, run_size;
 
 	for(int i = 1; i < argc; i++){
 		if(strcmp(argv[i], "-m") == 0 && i + 1 < argc)
 			ram_mb = (size_t)strtoul(argv[++i], NULL, 0);
+		else if(strcmp(argv[i], "-smp") == 0 && i + 1 < argc)
+			ncpu = atoi(argv[++i]);
 		else if(strcmp(argv[i], "-c") == 0 && i + 1 < argc)
 			cmdline = argv[++i];
 		else if(strcmp(argv[i], "-dump-dtb") == 0 && i + 1 < argc)
@@ -1007,7 +1192,11 @@ main(int argc, char **argv)
 	madvise(ram, ram_size, MADV_HUGEPAGE);
 
 	dtb = ram + (dtb_pa - RAM_BASE);
-	build_fdt(dtb, ram_size, cmdline);
+	if(ncpu < 1)
+		ncpu = 1;
+	if(ncpu > MAX_CPUS)
+		ncpu = MAX_CPUS;
+	build_fdt(dtb, ram_size, cmdline, ncpu);
 	if(dtb_out != NULL){
 		int fd = open(dtb_out, O_WRONLY | O_CREAT | O_TRUNC, 0644);
 
@@ -1070,47 +1259,57 @@ main(int argc, char **argv)
 	/* vCPU before the vGIC: the redistributor set is sized from the
 	 * created vCPUs, and this kernel answers EBUSY to CREATE_VCPU
 	 * once a vGIC has been initialized without one. */
-	vcpu = ioctl(vm, KVM_CREATE_VCPU, 0);
-	if(vcpu < 0)
-		die("KVM_CREATE_VCPU");
-	if(ioctl(vcpu, KVM_ARM_VCPU_INIT, &init) < 0)
-		die("KVM_ARM_VCPU_INIT");
+	for(int i = 0; i < ncpu; i++){
+		struct kvm_vcpu_init vi = init;
+
+		vcs[i].idx = i;
+		vcs[i].fd = ioctl(vm, KVM_CREATE_VCPU, i);
+		if(vcs[i].fd < 0)
+			die("KVM_CREATE_VCPU");
+		/* vCPUs are on by default; a secondary has to start
+		 * powered off or PSCI CPU_ON answers ALREADY_ON. */
+		if(i != 0)
+			vi.features[0] |= 1u << KVM_ARM_VCPU_POWER_OFF;
+		if(ioctl(vcs[i].fd, KVM_ARM_VCPU_INIT, &vi) < 0){
+			if(i == 0)
+				die("KVM_ARM_VCPU_INIT");
+			vi.features[0] &= ~(1u << KVM_ARM_VCPU_POWER_OFF);
+			if(ioctl(vcs[i].fd, KVM_ARM_VCPU_INIT, &vi) < 0)
+				die("KVM_ARM_VCPU_INIT");
+			fprintf(stderr, "[9vm-arm64] no KVM_ARM_VCPU_POWER_OFF; "
+			        "SMP will report ALREADY_ON\n");
+		}
+	}
 
 	setup_vgic(vm);
 
 	run_size = ioctl(kvm, KVM_GET_VCPU_MMAP_SIZE, 0);
 	if(run_size <= 0)
 		die("KVM_GET_VCPU_MMAP_SIZE");
-	run = mmap(NULL, (size_t)run_size, PROT_READ | PROT_WRITE, MAP_SHARED, vcpu, 0);
-	if(run == MAP_FAILED)
-		die("mmap kvm_run");
 
 	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
 	        ram, ram_size);
 
-	set_one_reg(vcpu,
-	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
-	                KVM_REG_ARM_CORE_REG(regs.pc), entry);
-	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
-	        ram, ram_size);
+	for(int i = 0; i < ncpu; i++){
+		vcs[i].run = mmap(NULL, (size_t)run_size, PROT_READ | PROT_WRITE,
+		                  MAP_SHARED, vcs[i].fd, 0);
+		if(vcs[i].run == MAP_FAILED)
+			die("mmap kvm_run");
+		if(i != 0)
+			continue;	/* PSCI sets these when the guest starts it */
+		set_one_reg(vcs[i].fd, CORE_REG(regs.pc), entry);
+		set_one_reg(vcs[i].fd, CORE_REG(regs.regs[0]), dtb_pa);
+		set_one_reg(vcs[i].fd, CORE_REG(regs.pstate), 0x3c5);
+	}
 
-	set_one_reg(vcpu,
-	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
-	                KVM_REG_ARM_CORE_REG(regs.regs[0]), dtb_pa);
-	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
-	        ram, ram_size);
-
-	set_one_reg(vcpu,
-	            KVM_REG_ARM64 | KVM_REG_SIZE_U64 | KVM_REG_ARM_CORE |
-	                KVM_REG_ARM_CORE_REG(regs.pstate), 0x3c5);
-
-	fprintf(stderr, "[9vm-arm64] pc=0x%llx dtb=0x%llx ram=%llu MB\n",
+	fprintf(stderr, "[9vm-arm64] pc=0x%llx dtb=0x%llx ram=%llu MB smp=%d\n",
 	        (unsigned long long)entry, (unsigned long long)dtb_pa,
-	        (unsigned long long)ram_mb);
+	        (unsigned long long)ram_mb, ncpu);
 
+	if(pipe(stop_pipe) < 0)
+		die("pipe");
 	signal(SIGINT, on_signal);
 	signal(SIGTERM, on_signal);
-	signal(SIGALRM, on_alarm);
 	if(isatty(STDIN_FILENO) && tcgetattr(STDIN_FILENO, &tty_orig) == 0){
 		struct termios raw = tty_orig;
 
@@ -1125,87 +1324,16 @@ main(int argc, char **argv)
 		if(fl >= 0)
 			fcntl(STDIN_FILENO, F_SETFL, fl | O_NONBLOCK);
 	}
-	struct itimerval it = { { 0, 20000 }, { 0, 20000 } };	/* 20 ms */
+	{
+		pthread_t th[MAX_CPUS], in;
 
-	setitimer(ITIMER_REAL, &it, NULL);
-
-	while(running){
-		if(ioctl(vcpu, KVM_RUN, 0) < 0){
-			if(errno == EINTR){
-				poll_stdin();
-				continue;
-			}
-			die("KVM_RUN");
-		}
-
-		switch(run->exit_reason){
-		case KVM_EXIT_MMIO: {
-			uint64_t pa = run->mmio.phys_addr;
-			uint32_t len = run->mmio.len;
-
-			if(pa >= UART_BASE && pa < UART_BASE + UART_SIZE){
-				uint32_t off = (uint32_t)(pa - UART_BASE);
-				uint32_t v = 0;
-
-				if(run->mmio.is_write){
-					for(uint32_t i = 0; i < len; i++)
-						v |= (uint32_t)run->mmio.data[i] << (8 * i);
-					uart_write(off, v);
-				} else {
-					v = uart_read(off);
-					for(uint32_t i = 0; i < len; i++)
-						run->mmio.data[i] = (uint8_t)(v >> (8 * i));
-				}
-				break;
-			}
-			if(pa >= VIRTIO_MMIO_BASE &&
-			   pa < VIRTIO_MMIO_BASE + VIRTIO_MMIO_STRIDE * VIRTIO_MMIO_SLOTS){
-				uint64_t slot = (pa - VIRTIO_MMIO_BASE) / VIRTIO_MMIO_STRIDE;
-
-				if(slot == 0){
-					uint64_t off = pa - VIRTIO_MMIO_BASE;
-
-					if(run->mmio.is_write)
-						v9_mmio_write(off, run->mmio.data, len);
-					else
-						v9_mmio_read(off, run->mmio.data, len);
-					break;
-				}
-			}
-			if(!run->mmio.is_write)
-				memset(run->mmio.data, 0, len);
-			else if(getenv("VM_TRACE"))
-				fprintf(stderr, "\n[9vm-arm64] unhandled MMIO write 0x%llx len %u\n",
-				        (unsigned long long)pa, len);
-			break;
-		}
-		case KVM_EXIT_SYSTEM_EVENT:
-			fprintf(stderr, "\n[9vm-arm64] guest shutdown (type %u)\n",
-			        run->system_event.type);
-			running = 0;
-			break;
-#ifdef KVM_EXIT_ARM_NISV
-		case KVM_EXIT_ARM_NISV:
-			fprintf(stderr, "\n[9vm-arm64] unhandled guest fault at 0x%llx esr 0x%llx\n",
-			        (unsigned long long)run->arm_nisv.fault_ipa,
-			        (unsigned long long)run->arm_nisv.esr_iss);
-			return 1;
-#endif
-		case KVM_EXIT_FAIL_ENTRY:
-			fprintf(stderr, "\n[9vm-arm64] hardware entry failure 0x%llx\n",
-			        (unsigned long long)run->fail_entry.hardware_entry_failure_reason);
-			return 1;
-		case KVM_EXIT_INTERNAL_ERROR:
-			fprintf(stderr, "\n[9vm-arm64] internal error %u\n", run->internal.suberror);
-			return 1;
-		case KVM_EXIT_SHUTDOWN:
-			fprintf(stderr, "\n[9vm-arm64] guest reset/shutdown\n");
-			running = 0;
-			break;
-		default:
-			fprintf(stderr, "\n[9vm-arm64] exit reason %u\n", run->exit_reason);
-			return 1;
-		}
+		for(int i = 0; i < ncpu; i++)
+			if(pthread_create(&th[i], NULL, vcpu_thread, &vcs[i]) != 0)
+				die("pthread_create");
+		if(pthread_create(&in, NULL, stdin_thread, NULL) != 0)
+			die("pthread_create");
+		for(int i = 0; i < ncpu; i++)
+			pthread_join(th[i], NULL);
 	}
 	return 0;
 }
