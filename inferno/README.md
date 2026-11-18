@@ -293,15 +293,27 @@ echo bind ether ether0 > /net/ipifc/0/ctl
 echo add 10.0.0.2 255.255.255.0 > /net/ipifc/0/ctl
 ```
 
-The guest also reads `/n/host/net.conf` at boot (`ip=`, `mask=`, `dns=`,
-`cmd=`).  Give it a resolver reachable from the tap and init starts
-`ndb/dns` in forward mode and `ndb/cs`:
+The guest also reads `/n/host/net.conf` at boot (`ip=`, `mask=`,
+`gateway=`, `dns=`, `cmd=`).  With a resolver reachable from the tap,
+init starts `ndb/dns` in forward mode and always starts `ndb/cs`:
 
 ```
 ip=10.0.0.2
 mask=255.255.255.0
 dns=10.0.0.1
 ```
+
+Without `dns=` but with a default route, `ndb/dns` recurses from the
+root hints in `/lib/ndb/dns` (the host side of the tap must forward and
+NAT):
+
+```
+ip=10.0.0.2
+mask=255.255.255.0
+gateway=10.0.0.1
+```
+
+Both paths feed `cs`, so `dial`/`tlsget` work by domain name.
 
 Then any TCP service reachable from the namespace, including a 9P server, can
 be mounted directly:
