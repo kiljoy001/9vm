@@ -32,7 +32,10 @@
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <net/if.h>
+#include <sys/ioctl.h>
 #include <sys/stat.h>
+#include <linux/if_tun.h>
 #include <termios.h>
 #include <time.h>
 #include <unistd.h>
@@ -930,6 +933,378 @@ v9_mmio_read(uint64_t off, uint8_t *data, uint32_t len)
 	memcpy(data, v9dev.bar0 + off, len);
 }
 
+
+/* ---- virtio-net over virtio-mmio (standard v2 registers) ----
+ *
+ * The guest driver polls its used ring from a kernel process, so no
+ * interrupt is needed: this side only has to keep guest buffers filled
+ * from the tap.  A thread per device does that.
+ */
+
+#define VNET_QSIZE	256
+#define VNET_SLOTS	2		/* 0 = RX, 1 = TX */
+#define VNET_HDR	12		/* virtio_net_hdr */
+
+enum {
+	VnetMagic = 0x74726976,
+	VnetDevice = 1,			/* virtio net */
+	VnetVersion = 2,
+
+	VnetDevFeatures = 0x010, VnetDevSelect = 0x014,
+	VnetDrvFeatures = 0x020, VnetDrvSelect = 0x024,
+	VnetQueueSel = 0x030, VnetQueueMax = 0x034, VnetQueueNum = 0x038,
+	VnetQueueReady = 0x044,
+	VnetNotify = 0x050, VnetInterrupt = 0x060, VnetInterruptAck = 0x064,
+	VnetStatus = 0x070,
+	VnetDesc = 0x080, VnetAvail = 0x090, VnetUsed = 0x0a0,
+	VnetConfig = 0x100,
+};
+
+struct vq {
+	uint16_t size;
+	uint16_t num;
+	int ready;
+	uint64_t desc;
+	uint64_t avail;
+	uint64_t used;
+	uint16_t last_avail;
+};
+
+struct vnet {
+	uint8_t bar0[0x1000];
+	uint8_t *ram;
+	uint64_t ram_size;
+	struct vq q[VNET_SLOTS];
+	int tapfd;
+	uint32_t irq;
+	uint64_t bar;
+	uint8_t mac[6];
+	int irq_level;
+	pthread_t thread;
+	int running;
+};
+
+static struct vnet vnet;
+static int vnet_present;
+
+static uint32_t
+vn_u32(int off)
+{
+	uint32_t v;
+
+	memcpy(&v, vnet.bar0 + off, 4);
+	return v;
+}
+
+static void
+vn_put32(int off, uint32_t v)
+{
+	memcpy(vnet.bar0 + off, &v, 4);
+}
+
+static uint64_t
+vn_u64(int off)
+{
+	uint64_t v;
+
+	memcpy(&v, vnet.bar0 + off, 8);
+	return v;
+}
+
+static uint8_t *
+vn_at(uint64_t gpa)
+{
+	return vnet.ram + (gpa - RAM_BASE);
+}
+
+static int
+vn_range(uint64_t addr, uint64_t len)
+{
+	if(len == 0 || addr < RAM_BASE || len > vnet.ram_size)
+		return 0;
+	return addr - RAM_BASE <= vnet.ram_size - len;
+}
+
+static int
+vn_open_tap(const char *name)
+{
+	struct ifreq ifr;
+	int fd;
+
+	fd = open("/dev/net/tun", O_RDWR | O_NONBLOCK | O_CLOEXEC);
+	if(fd < 0)
+		return -1;
+	memset(&ifr, 0, sizeof ifr);
+	ifr.ifr_flags = IFF_TAP | IFF_NO_PI;
+	if(name != NULL && *name != '\0')
+		snprintf(ifr.ifr_name, sizeof ifr.ifr_name, "%s", name);
+	if(ioctl(fd, TUNSETIFF, &ifr) < 0){
+		close(fd);
+		return -1;
+	}
+	fprintf(stderr, "[9vm-arm64] virtio-net tap '%s'\n", ifr.ifr_name);
+	return fd;
+}
+
+static void
+vnet_init(const char *tap, uint8_t *ram, uint64_t ram_size, uint32_t irq,
+          uint64_t bar)
+{
+	pid_t pid = getpid();
+
+	memset(&vnet, 0, sizeof vnet);
+	vnet.ram = ram;
+	vnet.ram_size = ram_size;
+	vnet.irq = irq;
+	vnet.bar = bar;
+	vnet.tapfd = vn_open_tap(tap);
+	vnet_present = vnet.tapfd >= 0;
+	/* local-administered, unique per runner */
+	vnet.mac[0] = 0x52;
+	vnet.mac[1] = 0x54;
+	vnet.mac[2] = 0x00;
+	vnet.mac[3] = (uint8_t)(pid >> 16);
+	vnet.mac[4] = (uint8_t)(pid >> 8);
+	vnet.mac[5] = (uint8_t)pid;
+
+	vn_put32(0x000, VnetMagic);
+	vn_put32(0x004, VnetVersion);
+	vn_put32(0x008, VnetDevice);
+	/* feature 0: MAC; feature 32 bit 0: VIRTIO_F_VERSION_1 */
+	vn_put32(VnetDevFeatures, 1u << 5);
+	vn_put32(VnetQueueMax, VNET_QSIZE);
+	memcpy(vnet.bar0 + VnetConfig, vnet.mac, 6);
+	vn_put32(VnetConfig + 8, 1);	/* link up */
+}
+
+/* Put one frame into the guest's RX ring, header first. */
+static int
+vnet_rx_frame(const uint8_t *frame, uint32_t len)
+{
+	struct vq *q = &vnet.q[0];
+	uint16_t avail_idx;
+	int done = 0;
+
+	if(!q->ready || q->size == 0 || len + VNET_HDR > 2048)
+		return 0;
+	if(!vn_range(q->desc, (uint64_t)q->size * 16) ||
+	   !vn_range(q->avail, 4 + (uint64_t)q->size * 2 + 2) ||
+	   !vn_range(q->used, 4 + (uint64_t)q->size * 8 + 2))
+		return 0;
+
+	avail_idx = *(uint16_t *)(vn_at(q->avail) + 2);
+	if(getenv("VM_TRACE_NET") && q->last_avail == avail_idx)
+		fprintf(stderr, "[net] rx: no guest buffers (last %u avail %u)\n",
+		        q->last_avail, avail_idx);
+	while(q->last_avail != avail_idx){
+		uint16_t slot = q->last_avail % q->size;
+		uint16_t head = *(uint16_t *)(vn_at(q->avail) + 4 + slot * 2);
+		uint64_t dpa;
+		uint32_t dlen;
+		uint16_t dflags;
+
+		q->last_avail++;
+		if(head >= q->size)
+			continue;
+		memcpy(&dpa, vn_at(q->desc) + (uint64_t)head * 16, 8);
+		memcpy(&dlen, vn_at(q->desc) + (uint64_t)head * 16 + 8, 4);
+		memcpy(&dflags, vn_at(q->desc) + (uint64_t)head * 16 + 12, 2);
+		if((dflags & 2) == 0 || !vn_range(dpa, dlen) || dlen < len + VNET_HDR)
+			continue;
+		memset(vn_at(dpa), 0, VNET_HDR);
+		memcpy(vn_at(dpa) + VNET_HDR, frame, len);
+		{
+			uint16_t used_idx = *(uint16_t *)(vn_at(q->used) + 2);
+			uint16_t us = used_idx % q->size;
+
+			*(uint32_t *)(vn_at(q->used) + 4 + us * 8) = head;
+			*(uint32_t *)(vn_at(q->used) + 4 + us * 8 + 4) = len + VNET_HDR;
+			__sync_synchronize();
+			*(uint16_t *)(vn_at(q->used) + 2) = used_idx + 1;
+		}
+		done = 1;
+		if(getenv("VM_TRACE_NET"))
+			fprintf(stderr, "[net] rx frame %u bytes -> guest slot %u\n",
+			        len, head);
+		break;
+	}
+	if(done){
+		vnet.bar0[VnetInterrupt] |= 1;
+		{
+			struct kvm_irq_level irq = { .irq = vnet.irq, .level = 1 };
+			ioctl(vm_fd, KVM_IRQ_LINE, &irq);
+		}
+	}
+	return done;
+}
+
+/* Drain the TX ring into the tap. */
+static void
+vnet_tx(void)
+{
+	struct vq *q = &vnet.q[1];
+	uint16_t avail_idx;
+
+	if(!q->ready || q->size == 0 || vnet.tapfd < 0)
+		return;
+	if(!vn_range(q->desc, (uint64_t)q->size * 16) ||
+	   !vn_range(q->avail, 4 + (uint64_t)q->size * 2 + 2) ||
+	   !vn_range(q->used, 4 + (uint64_t)q->size * 8 + 2))
+		return;
+
+	avail_idx = *(uint16_t *)(vn_at(q->avail) + 2);
+	while(q->last_avail != avail_idx){
+		uint16_t slot = q->last_avail % q->size;
+		uint16_t head = *(uint16_t *)(vn_at(q->avail) + 4 + slot * 2);
+		uint8_t frame[2048];
+		uint32_t flen = 0;
+		uint16_t d = head;
+		int ok = 1;
+
+		q->last_avail++;
+		if(head >= q->size)
+			continue;
+		for(uint16_t i = 0; i < q->size; i++){
+			uint64_t dpa;
+			uint32_t dlen;
+			uint16_t dflags, next;
+
+			memcpy(&dpa, vn_at(q->desc) + (uint64_t)d * 16, 8);
+			memcpy(&dlen, vn_at(q->desc) + (uint64_t)d * 16 + 8, 4);
+			memcpy(&dflags, vn_at(q->desc) + (uint64_t)d * 16 + 12, 2);
+			memcpy(&next, vn_at(q->desc) + (uint64_t)d * 16 + 14, 2);
+			if((dflags & 2) || !vn_range(dpa, dlen)){
+				ok = 0;
+				break;
+			}
+			if(dlen > sizeof frame - flen)
+				dlen = (uint32_t)sizeof frame - flen;
+			memcpy(frame + flen, vn_at(dpa), dlen);
+			flen += dlen;
+			if((dflags & 1) == 0)
+				break;
+			d = next;
+		}
+		if(ok && flen > VNET_HDR){
+			ssize_t n = write(vnet.tapfd, frame + VNET_HDR, flen - VNET_HDR);
+
+			if(getenv("VM_TRACE_NET"))
+				fprintf(stderr, "[net] tx frame %u bytes -> tap %zd (%s)\n",
+				        flen - VNET_HDR, n, n < 0 ? strerror(errno) : "ok");
+		}
+		{
+			uint16_t used_idx = *(uint16_t *)(vn_at(q->used) + 2);
+			uint16_t us = used_idx % q->size;
+
+			*(uint32_t *)(vn_at(q->used) + 4 + us * 8) = head;
+			*(uint32_t *)(vn_at(q->used) + 4 + us * 8 + 4) = 0;
+			__sync_synchronize();
+			*(uint16_t *)(vn_at(q->used) + 2) = used_idx + 1;
+		}
+	}
+}
+
+static void *
+vnet_thread(void *arg)
+{
+	uint8_t buf[2048];
+
+	(void)arg;
+	while(vnet.running){
+		struct pollfd p = { .fd = vnet.tapfd, .events = POLLIN };
+		ssize_t n;
+
+		if(poll(&p, 1, 200) <= 0)
+			continue;
+		n = read(vnet.tapfd, buf, sizeof buf);
+		if(n <= 0)
+			continue;
+		pthread_mutex_lock(&devlock);
+		vnet_rx_frame(buf, (uint32_t)n);
+		pthread_mutex_unlock(&devlock);
+	}
+	return NULL;
+}
+
+static void
+vnet_mmio_write(uint64_t off, const uint8_t *data, uint32_t len)
+{
+	uint32_t v = 0;
+
+	if(off + len > sizeof vnet.bar0)
+		return;
+	memcpy(vnet.bar0 + off, data, len);
+	for(uint32_t i = 0; i < len && i < 4; i++)
+		v |= (uint32_t)data[i] << (8 * i);
+
+	switch(off){
+	case VnetStatus:
+		if((v & 0xff) == 0){
+			for(int i = 0; i < VNET_SLOTS; i++)
+				vnet.q[i].last_avail = 0;
+			vnet.bar0[VnetInterrupt] = 0;
+		}
+		break;
+	case VnetQueueSel:
+		break;
+	case VnetQueueNum:
+		vnet.q[vn_u32(VnetQueueSel) & 1].num = (uint16_t)v;
+		break;
+	case VnetQueueReady:
+		vnet.q[vn_u32(VnetQueueSel) & 1].ready = (v & 1) != 0;
+		if(getenv("VM_TRACE_NET"))
+			fprintf(stderr, "[net] queue %u ready=%u num=%u\n",
+			        vn_u32(VnetQueueSel) & 1, v & 1,
+			        vnet.q[vn_u32(VnetQueueSel) & 1].num);
+		if((v & 1) != 0){
+			struct vq *q = &vnet.q[vn_u32(VnetQueueSel) & 1];
+
+			q->size = q->num ? q->num : VNET_QSIZE;
+			q->desc = vn_u64(VnetDesc);
+			q->avail = vn_u64(VnetAvail);
+			q->used = vn_u64(VnetUsed);
+			q->last_avail = 0;
+		}
+		break;
+	case VnetDesc:
+	case VnetAvail:
+	case VnetUsed:
+		break;
+	case VnetNotify: {
+		uint32_t q = vn_u32(VnetNotify) & 1;
+
+		if(getenv("VM_TRACE_NET"))
+			fprintf(stderr, "[net] notify queue %u\n", q);
+		if(q == 1)
+			vnet_tx();
+		break;
+	}
+	case VnetInterruptAck:
+		vnet.bar0[VnetInterrupt] &= (uint8_t)~v;
+		break;
+	default:
+		break;
+	}
+}
+
+static void
+vnet_mmio_read(uint64_t off, uint8_t *data, uint32_t len)
+{
+	if(off + len > sizeof vnet.bar0){
+		memset(data, 0, len);
+		return;
+	}
+	if(off == VnetDevFeatures){
+		uint32_t v = vn_u32(VnetDevSelect) == 1 ? 1u : (1u << 5);
+
+		memcpy(data, &v, len < 4 ? len : 4);
+		if(len > 4)
+			memset(data + 4, 0, len - 4);
+		return;
+	}
+	memcpy(data, vnet.bar0 + off, len);
+}
+
 /* ---- console input ---- */
 
 static void
@@ -1095,6 +1470,15 @@ handle_exit(struct vcpu_ctx *c)
 					v9_mmio_read(off, run->mmio.data, len);
 				return;
 			}
+			if(slot == 1 && vnet_present){
+				uint64_t off = pa - (VIRTIO_MMIO_BASE + VIRTIO_MMIO_STRIDE);
+
+				if(run->mmio.is_write)
+					vnet_mmio_write(off, run->mmio.data, len);
+				else
+					vnet_mmio_read(off, run->mmio.data, len);
+				return;
+			}
 		}
 		if(!run->mmio.is_write)
 			memset(run->mmio.data, 0, len);
@@ -1144,6 +1528,7 @@ main(int argc, char **argv)
 	const char *dtb_out = NULL;
 	const char *root_dir = ".";
 	const char *tag = "host9p";
+	const char *net_tap = NULL;
 	uint64_t ram_size;
 	size_t ram_mb = DEFAULT_RAM_MB;
 	uint8_t *ram, *dtb;
@@ -1164,10 +1549,12 @@ main(int argc, char **argv)
 			root_dir = argv[++i];
 		else if(strcmp(argv[i], "-tag") == 0 && i + 1 < argc)
 			tag = argv[++i];
+		else if(strcmp(argv[i], "-net-tap") == 0 && i + 1 < argc)
+			net_tap = argv[++i];
 		else if(argv[i][0] != '-' && kernel == NULL)
 			kernel = argv[i];
 		else {
-			fprintf(stderr, "usage: %s [-m MB] [-c cmdline] [-r root] [-tag name] [-dump-dtb file] <kernel.img|kernel.elf>\n",
+			fprintf(stderr, "usage: %s [-m MB] [-c cmdline] [-r root] [-tag name] [-net-tap if] [-dump-dtb file] <kernel.img|kernel.elf>\n",
 			        argv[0]);
 			return 2;
 		}
@@ -1289,6 +1676,10 @@ main(int argc, char **argv)
 
 	v9_init(tag, (uint32_t)(32 + VIRTIO_MMIO_IRQ0), VIRTIO_MMIO_BASE, &hostfs_inst,
 	        ram, ram_size);
+	if(net_tap != NULL)
+		vnet_init(net_tap, ram, ram_size,
+		          (uint32_t)(32 + VIRTIO_MMIO_IRQ0 + 1),
+		          VIRTIO_MMIO_BASE + VIRTIO_MMIO_STRIDE);
 
 	for(int i = 0; i < ncpu; i++){
 		vcs[i].run = mmap(NULL, (size_t)run_size, PROT_READ | PROT_WRITE,
@@ -1332,6 +1723,11 @@ main(int argc, char **argv)
 				die("pthread_create");
 		if(pthread_create(&in, NULL, stdin_thread, NULL) != 0)
 			die("pthread_create");
+		if(vnet_present){
+			vnet.running = 1;
+			if(pthread_create(&vnet.thread, NULL, vnet_thread, NULL) != 0)
+				die("pthread_create");
+		}
 		for(int i = 0; i < ncpu; i++)
 			pthread_join(th[i], NULL);
 	}
