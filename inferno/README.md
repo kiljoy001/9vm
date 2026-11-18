@@ -293,6 +293,16 @@ echo bind ether ether0 > /net/ipifc/0/ctl
 echo add 10.0.0.2 255.255.255.0 > /net/ipifc/0/ctl
 ```
 
+The guest also reads `/n/host/net.conf` at boot (`ip=`, `mask=`, `dns=`,
+`cmd=`).  Give it a resolver reachable from the tap and init starts
+`ndb/dns` in forward mode and `ndb/cs`:
+
+```
+ip=10.0.0.2
+mask=255.255.255.0
+dns=10.0.0.1
+```
+
 Then any TCP service reachable from the namespace, including a 9P server, can
 be mounted directly:
 
