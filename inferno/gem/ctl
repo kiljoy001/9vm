@@ -1,0 +1,8 @@
+title 9vm Gemini
+text served from the guest on boot
+set node 9vm
+set tls bearssl
+title Updated
+text live edit on the 9vm server
+set node purgatorio
+del tls

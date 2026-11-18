@@ -10,7 +10,10 @@ all: 9vm test_payload.elf
 test_payload.elf: test_payload.S
 	$(CC) $(PAYLOAD_CFLAGS) -Wl,-Ttext,0x100000 -o test_payload.elf test_payload.S
 
+kvm-arm64-smoke: kvm-arm64-smoke.c
+	$(CC) $(CFLAGS) -o $@ $<
+
 clean:
-	rm -f 9vm test_payload.elf
+	rm -f 9vm test_payload.elf kvm-arm64-smoke
 
 .PHONY: all clean
