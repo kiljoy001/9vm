@@ -247,20 +247,49 @@ AEAD round trip with tampered tag and associated data, X25519 agreement, and
 EdDSA sign/verify.  `mono(2)` documents the module.
 
 `listen -a mono`, `rcmd -e mono` and `cpu -C mono` select a Monocypher
-authentication and transport (`monoauth(8)`): EdDSA certificates from
-`certify`, X25519 key exchange, BLAKE2b key derivation and an
-XChaCha20-Poly1305 record stream.  One session works end to end, including
-one run as a second user:
+authentication and transport (`monoauth(8)`).  In protocol version 2 each
+hello carries the identity, an X25519 key, the scope (`domain` and `path`)
+and a `monoca` epoch proof; the two hellos are hashed into a transcript
+that the server signs and the client signs back, and the session keys are
+derived from the X25519 secret and that transcript.  A peer without a
+proof is accepted only under `box/`, so a missing, stale or unverifiable
+epoch fails closed rather than granting more.
+
+`monoca(8)` publishes the authorised set as a signed Merkle root:
+
+```
+; monoca status
+epoch 1 time 1794832218 age 1 window 3600 fresh 1
+root e38ba287e7c67af6509ff4bfda77adb4ab98269921a29c7588aa35e1eb99781c
+leaves 1
+signer 32e5bd5e8d956339bd15a24fe7e4709567a6aac909c02ab3ba81c77af82cd9fa
+```
+
+`certify firstboot` enrolls the console user and publishes the first
+epoch, and init then starts `monoca daemon`, which republishes when the
+leaves change or when half the epoch window has passed.  Without it an
+unattended machine would reduce every identity to `box/` after an hour.
+
+The signer secret is `/keydb/mono-signer`; every verifier reads only
+`/keydb/mono-signer.pub`.  When the host supplies a key file
+(`/n/host/keydb/mono.key`, 32 random bytes in hex or a passphrase, or
+`certify -k file`) the secret is encrypted at rest with Argon2id and
+XChaCha20-Poly1305, and the daemon keeps the plaintext only in memory.
+Rotation is `certify rotate`, copy the new `mono-signer.next.pub` to the
+peers as `mono-signer.pub`, then `certify activate`; both keys stay
+trusted while the change is distributed.
+
+One session works end to end through the default `svcd.conf`:
 
 ```
 ; rcmd -e mono tcp!127.0.0.1!6668 echo mono-ok
 mono-ok
 ```
 
-The default `svcd.conf` now selects `-a mono`.  One connection still carries
-one session: the link multiplexes tags, but `listen` does not yet accept more
-than one session per link and `rcmd` opens a fresh link each time.  See
-`man/8/monoauth` in the purgatorio tree for the protocol and the limits.
+One connection still carries one session: the link multiplexes tags, but
+`listen` does not yet accept more than one session per link and `rcmd`
+opens a fresh link each time.  See `man/8/monoauth` in the purgatorio tree
+for the protocol and the limits.
 
 ## virtio-net
 
