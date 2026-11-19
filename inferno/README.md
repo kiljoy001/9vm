@@ -184,6 +184,44 @@ shows a service's output and `svcctl ctl` shows svcd's event log.  See
 client's namespace, binds its `/dev`, applies `/lib/cpud.conf` and logs the
 session.  `cpu` and `rcmd` are the clients.
 
+### The Gemini page
+
+`gem` runs `/dis/gemserve.dis` on port 1965, with TLS terminated in the
+guest (TLS 1.3 in Dis, TLS 1.2 through BearSSL).  It serves one page with
+three things:
+
+- **display scale**: the page shows the percentage the viewer applies to
+  the 1024x768 frame, and `=> /scale` asks for a new value (25 to 400).
+  gemserve writes `#g/scale` and the `scale` field at the end of the
+  shared `vmdisplay` header, so a viewer that maps the region
+  (`vmdisplay_client_scale()`) can follow it.  The guest frame itself
+  stays 1024x768.
+- **programs**: every `.dis` in the host drop directory `dis` under
+  9vm's root (seen as `/n/host/dis`) is listed with its size and offered
+  at `/dis/NAME`.  `install NAME` copies it into `/dislocal`, which init
+  binds after the read-only `/dis`, so it runs as `/dis/NAME`.
+- **storage**: the page names the current 9P mount.  `mount SRC [PATH]`
+  takes a dial address (`tcp!host!port`) or a device such as `#~/ns`,
+  the host relay; `unmount [PATH]` removes it.  The
+  mount lives in gemserve's namespace, so the page and anything gemserve
+  runs see it, not the shell.
+
+Commands are appended to `gem/ctl`, which the guest reads at `/n/host/gem/ctl`:
+
+```sh
+echo 'scale 150' >> gem/ctl
+cp hello.dis dis/
+echo 'install hello.dis' >> gem/ctl
+echo 'mount tcp!10.0.0.1!564 /n/store' >> gem/ctl
+echo 'unmount /n/store' >> gem/ctl
+```
+
+The control file is a log replayed from the start, so old commands run
+again after a restart; `clear` resets only the status message.  Drop
+files and the page are readable by anyone who reaches port 1965, and
+whoever can append to `gem/ctl` decides what is installed: the file's
+permissions are the policy.  See `gemserve(8)`.
+
 ### Authentication
 
 Init runs `certify firstboot` before svcd: it creates a signer key in

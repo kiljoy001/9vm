@@ -40,6 +40,8 @@ struct vmdisplay {
     uint32_t input_tail;
     char input[VMDISPLAY_EVENTS][VMDISPLAY_EVENT_BYTES];
     uint32_t pixels[VMDISPLAY_SLOTS][VMDISPLAY_WIDTH * VMDISPLAY_HEIGHT];
+    /* viewer scale, percent (100 = 1:1); written by the guest */
+    uint32_t scale;
 };
 
 #endif

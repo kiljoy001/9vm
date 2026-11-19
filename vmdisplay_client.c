@@ -113,6 +113,13 @@ vmdisplay_client_frame(struct vmdisplay_client *client, uint32_t *pixels,
     return copied;
 }
 
+uint32_t
+vmdisplay_client_scale(struct vmdisplay_client *client)
+{
+    return (client != NULL && client->display != NULL) ?
+        client->display->scale : 0;
+}
+
 int
 vmdisplay_client_input(struct vmdisplay_client *client, const char *record)
 {

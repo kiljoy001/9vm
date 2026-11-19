@@ -19,6 +19,7 @@ void vmdisplay_client_close(struct vmdisplay_client *client);
 int vmdisplay_client_frame(struct vmdisplay_client *client, uint32_t *pixels,
                            size_t pixel_count, uint64_t *serial);
 int vmdisplay_client_input(struct vmdisplay_client *client, const char *record);
+uint32_t vmdisplay_client_scale(struct vmdisplay_client *client);
 int vmdisplay_client_input_wait(struct vmdisplay_client *client,
                                 const char *record, int timeout_ms);
 

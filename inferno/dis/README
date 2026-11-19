@@ -1,0 +1,15 @@
+Host drop directory for the 9vm Gemini page.
+
+The guest mounts this directory at /n/host (9vm is started with the
+inferno tree as its root), so the drop directory appears as
+/n/host/dis.  Copy a .dis file here:
+
+	cp hello.dis inferno/dis/
+
+The page lists every .dis file here and offers it for download at
+/dis/NAME.  To run one inside the guest, append to gem/ctl:
+
+	echo install hello.dis >> gem/ctl
+
+gemserve copies it into /dislocal, which init binds after the
+read-only /dis, so the program then runs as /dis/hello.dis.
