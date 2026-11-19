@@ -285,7 +285,10 @@ The signer secret is `/keydb/mono-signer`; every verifier reads only
 XChaCha20-Poly1305, and the daemon keeps the plaintext only in memory.
 Rotation is `certify rotate`, copy the new `mono-signer.next.pub` to the
 peers as `mono-signer.pub`, then `certify activate`; both keys stay
-trusted while the change is distributed.
+trusted while the change is distributed.  The CA state itself moves with
+`monoca serve` on one host and `monoca sync tcp!host!2020` on a peer; the
+epoch is signed and the root covers the leaves, so the plain 9P export
+does not have to be trusted for integrity.
 
 One session works end to end through the default `svcd.conf`:
 
@@ -350,7 +353,8 @@ mask=255.255.255.0
 gateway=10.0.0.1
 ```
 
-Both paths feed `cs`, so `dial`/`tlsget` work by domain name.
+Both paths feed `cs`, so `dial`/`tlsget` work by domain name.  A
+truncated UDP reply is retried over TCP, so a large answer is not lost.
 
 Then any TCP service reachable from the namespace, including a 9P server, can
 be mounted directly:
