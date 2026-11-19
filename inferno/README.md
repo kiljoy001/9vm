@@ -355,6 +355,22 @@ gateway=10.0.0.1
 
 Both paths feed `cs`, so `dial`/`tlsget` work by domain name.  A
 truncated UDP reply is retried over TCP, so a large answer is not lost.
+`ip6` asks for AAAA records, and a resolver or root hint may be an IPv6
+address (`ip6=` in the ndb entry); the IPv4 address is tried first and
+the IPv6 one after it fails.
+
+IPv6 on the tap is configured by hand, because the guest gets only the
+IPv4 address from `net.conf`:
+
+```
+; echo add fd00::2 /64 > /net/ipifc/1/ctl
+```
+
+With `ip -6 addr add fd00::1/64 dev tap0` on the host, the guest and host
+reach each other (NDP works; `fd00::/7` is treated as site-local for
+source selection).  `cmd=` in `net.conf` can run the address command at
+boot.  Virtio-net has no multicast filter, so the join is a no-op; the
+link is a tap rather than a shared LAN.
 
 Then any TCP service reachable from the namespace, including a 9P server, can
 be mounted directly:
