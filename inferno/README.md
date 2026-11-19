@@ -155,12 +155,20 @@ exponential backoff:
 
 ```
 # /n/host/svcd.conf
-cpu	/dis/sh.dis -c 'listen -a rc4_128 tcp!*!6668 /dis/sh.dis /lib/cpusession.sh'
+cpu	/dis/sh.dis -c 'listen -a mono tcp!*!6668 /dis/sh.dis /lib/cpusession.sh'
+gem	/dis/gemserve.dis
+monoca	/dis/monoca.dis daemon
 ```
+
+A host configuration replaces `/lib/svcd.conf`, so it lists every
+service: the image's default file has `gem` and `monoca`, the host adds
+`cpu`.  `monoca` waits for the signer if firstboot has not made one yet.
 
 ```
 ; svcctl
-cpu running(group) pid=11 restarts=0
+cpu running(group) pid=13 restarts=0
+gem running pid=14 restarts=0
+monoca running pid=15 restarts=0
 ; rcmd -e rc4_128 tcp!127.0.0.1!6668 echo hello
 hello
 ; svcctl stop cpu
