@@ -459,6 +459,11 @@ kernel stacks; `^T^T K` dumps the console queues and the `kbddrops` counter.
   Adding a user means running `certify user` on the server by hand and
   copying the file to the client out of band.  There is no key directory,
   no per-user allowlist and no audit beyond `/tmp/cpud.log`.
+- A freshly provisioned image crashes in the guest's heap on its first
+  boot, in about half the boots, while certify creates the signer (the
+  panic is `pool main CORRUPT`, or `lockloop`, right after monoca's epoch
+  line).  The next boot is stable.  It reproduces with the clock code
+  removed -- the corruption is in the guest's crypto/key path, not here.
 - 9vm has no battery-backed clock, so the guest starts at 1970-01-01.
   init(8) sets `/dev/time` from the host's virtual `/n/host/time` and
   timed(8) holds it there (see "9vm host filesystem"), so dates inside the
