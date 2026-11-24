@@ -11,7 +11,9 @@ console and checks, from inside:
   1. /n/host/time is live (two readings five seconds apart differ by five
      seconds, not zero),
   2. the guest clock is within a few hundred milliseconds of it,
-  3. a corrupted guest clock (set to 1970) is stepped back to the host's.
+  3. a corrupted guest clock (set to 1970) is stepped back to the host's,
+  4. a host that is suspended for five seconds is caught up on resume,
+  5. the file refuses writes and removes.
 
 It needs a provisioned root image (./provision.sh) and the converted
 kernel (./mkelf.py).  Exit status is 0 on success, 1 on failure.
@@ -20,6 +22,7 @@ import argparse
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -182,6 +185,19 @@ def main():
         console.wait_for_re(r"(?m)^remove1\s*$", 20)
         if "time cannot be removed" not in console.text:
             failures.append("a remove of /n/host/time was not refused")
+
+        # A suspended host keeps its clock; the guest's ticks stop.  The
+        # first reading after it resumes must be stepped, not slewed.
+        os.kill(console.proc.pid, signal.SIGSTOP)
+        time.sleep(5)
+        os.kill(console.proc.pid, signal.SIGCONT)
+        time.sleep(3)
+        host4, guest4 = probe(console)
+        off4 = guest4 - host4
+        if abs(off4) > SETTLED_US:
+            failures.append(
+                f"guest clock not recovered after a host suspend: {off4} us")
+        print(f"after a 5s host suspend: offset {off4/1000:.1f}ms")
     except (TimeoutError, AssertionError, OSError) as e:
         failures.append(str(e))
     finally:
