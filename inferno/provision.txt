@@ -6,7 +6,12 @@ cp -r /fonts/misc /n/fonts/misc
 cp -r /lib /n
 cat /osinit.dis > /n/osinit.dis
 mkdir /n/chan /n/dev /n/env /n/fd /n/n /n/n/remote /n/net /n/nvfs /n/prog
-echo PROVISION-OK
 ls /n
 ls /n/icons/tk
 ls /n/fonts/misc
+# Clunk the mount so the kfs server exits and marks the file system
+# clean.  Killed with the mount still held, the image needs a check on
+# its first boot.
+unmount /n
+sleep 1
+echo PROVISION-OK

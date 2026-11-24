@@ -22,6 +22,7 @@ loop.  Everything here was used to validate the state described at the bottom.
 | `provision.txt` | the shell script fed to the guest (mount `kfs64 -r -b 4096`, copy, mkdir device dirs) |
 | `boot.sh` | boot 9vm with `-disk` and optionally `-display-shm` |
 | `testclock.py` | boot and check the guest clock against the host's `/n/host/time` |
+| `testboot.py` | boot copies of a freshly provisioned image N times, fail on a crash |
 | `draindisp.py` | consume committed frames from `/dev/shm/<name>` and write a PPM |
 | `sendinput.py` | inject input records (`key 104 0`, `move X Y`, …) into the same region |
 | `makesymelf.py` | build `ipc-sym.elf` (symbols) from the a.out, for gdb/symlookup |
@@ -348,6 +349,45 @@ One connection still carries one session: the link multiplexes tags, but
 opens a fresh link each time.  See `man/8/monoauth` in the purgatorio tree
 for the protocol and the limits.
 
+## The Dis JIT
+
+The kernel compiles Dis modules to native 386 code when they load
+(`cflag` in `os/port/dis.c`, the code generator in
+`libinterp/comp-386.c`).  It is on by default; a file `jit` at the root
+of the host export (`/n/host/jit`) containing 0 makes init run the
+interpreter for that boot instead, and `/dev/jit` can be written at any
+time.  It earns its place: a 5M-iteration Limbo loop takes under 1 ms
+compiled against ~80 ms interpreted, and I/O-bound paths are unchanged.
+
+There is an intermittent boot crash around it that is **not** the JIT's,
+and it is not fixed.  It hits right after firstboot, and takes one of
+several forms (`pool main CORRUPT: bad magic`, `lockloop`,
+`fault read addr=0xfffffff1`, or `trap: fault read` inside a Dis
+program).  Instrumenting the collector shows the common cause:
+
+```
+rootset: prog 8361f568 pid 48 state 15 R.M 1 SP dput+0x3b FP ... PC ...
+```
+
+`rootset` (in `libinterp/gc.c`) walks the guest's program list and finds
+a `Prog` whose register set has been overwritten -- the module pointer is
+1, the stack pointer is a text address, the state is 15 -- then marks
+through it.  The allocation history of the block says `newprog`
+allocated it and never freed it, so something writes over a live `Prog`
+(its 16-byte neighbours look like an array of `{name, ptr, int, code
+pointer}` words).  It reproduces with the JIT on and off, and with the
+clock code removed, so it predates this work.  The rate depends on the
+image and the timing: a run of 46 first boots passed, another build
+crashes in 1 of 2.
+
+To work on it: `testboot.py` boots copies of a freshly provisioned image
+and stops at the first crash; the instrumentation used above is a check
+in `rootset` before `Setmark`, the `histdump` ring in `os/port/alloc.c`
+(malloc/free history, dumped from `rootset`) and prints in
+`certify`/`monoca`/`init` around firstboot.  Look at anything that
+writes a `Prog` or its `Osenv` (which follows it in the same block),
+and at the run-list manipulation in `os/port/dis.c`.
+
 ## virtio-net
 
 `os/pc/ethervirtio.c` drives 9vm's virtio-net device.  9vm only creates the
@@ -459,11 +499,10 @@ kernel stacks; `^T^T K` dumps the console queues and the `kbddrops` counter.
   Adding a user means running `certify user` on the server by hand and
   copying the file to the client out of band.  There is no key directory,
   no per-user allowlist and no audit beyond `/tmp/cpud.log`.
-- A freshly provisioned image crashes in the guest's heap on its first
-  boot, in about half the boots, while certify creates the signer (the
-  panic is `pool main CORRUPT`, or `lockloop`, right after monoca's epoch
-  line).  The next boot is stable.  It reproduces with the clock code
-  removed -- the corruption is in the guest's crypto/key path, not here.
+- The guest has an intermittent boot crash that writes over a live
+  `Prog` in the program list; the collector then marks through the
+  garbage.  It is not the JIT and not the clock code; see "The Dis JIT"
+  for the evidence and where to look.
 - 9vm has no battery-backed clock, so the guest starts at 1970-01-01.
   init(8) sets `/dev/time` from the host's virtual `/n/host/time` and
   timed(8) holds it there (see "9vm host filesystem"), so dates inside the
