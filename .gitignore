@@ -3,7 +3,6 @@ test_payload.elf
 __pycache__/
 *.pyc
 build/
-inferno/time
 9vm-arm64
 kvm-arm64-smoke
 kvm-arm64-probe

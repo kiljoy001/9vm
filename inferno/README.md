@@ -21,6 +21,7 @@ loop.  Everything here was used to validate the state described at the bottom.
 | `provision.sh` | create a 32 MiB image and populate it with `/dis`, `/icons`, `/fonts/misc`, `/lib/wmsetup` |
 | `provision.txt` | the shell script fed to the guest (mount `kfs64 -r -b 4096`, copy, mkdir device dirs) |
 | `boot.sh` | boot 9vm with `-disk` and optionally `-display-shm` |
+| `testclock.py` | boot and check the guest clock against the host's `/n/host/time` |
 | `draindisp.py` | consume committed frames from `/dev/shm/<name>` and write a PPM |
 | `sendinput.py` | inject input records (`key 104 0`, `move X Y`, …) into the same region |
 | `makesymelf.py` | build `ipc-sym.elf` (symbols) from the a.out, for gdb/symlookup |
@@ -122,6 +123,13 @@ hypervisor offers it.  The kernel device is `#~` (`os/pc/devhostring.c`):
 - The exported directory is 9vm's `-r` argument (the current directory by
   default).  The mount is best effort: without the ring the init prints
   `init: no 9ring host transport` and continues.
+- The export root carries `time`, a virtual file that has no bytes on the
+  host: every read formats the host's clock (microseconds since the epoch,
+  one decimal number), so it is never stale.  The guest has no RTC, so
+  init(8) sets `/dev/time` from it at boot and timed(8) reads it once a
+  second to step or slew the guest clock; a host that is stepped by NTP or
+  suspended carries into the guest the same way.  Writes and removes are
+  refused.
 
 ```sh
 mount -A '#~/host' /n/host
@@ -452,5 +460,8 @@ kernel stacks; `^T^T K` dumps the console queues and the `kbddrops` counter.
   copying the file to the client out of band.  There is no key directory,
   no per-user allowlist and no audit beyond `/tmp/cpud.log`.
 - 9vm has no battery-backed clock, so the guest starts at 1970-01-01.
-  Certificates are issued with expiry 0 (never), which is what makes that
-  workable; anything that compares dates inside the VM will be wrong.
+  init(8) sets `/dev/time` from the host's virtual `/n/host/time` and
+  timed(8) holds it there (see "9vm host filesystem"), so dates inside the
+  VM are real while the host clock is.  Certificates are still issued with
+  expiry 0 (never), and a guest booted without the host filesystem keeps
+  the 1970 clock until SNTP answers.

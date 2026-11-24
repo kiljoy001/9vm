@@ -36,10 +36,10 @@ elf=${2:-$work/ipc.elf}
 set -- -c "$cmd" -disk "$img"
 [ -n "$net" ] && set -- "$@" -net-tap "$net"
 
-# 9vm gives the guest no RTC, so init(8) reads /n/host/time once at boot
-# and sets /dev/time from it.  Publish the host clock now, or every boot
-# starts at whatever moment the file was last written.
-date +%s > "$here/time"
+# 9vm gives the guest no RTC.  The host filesystem carries a virtual
+# `time' at its root (microseconds since the epoch, read at the moment of
+# the request), so init(8) sets /dev/time from /n/host/time at boot and
+# timed(8) keeps it in step with this machine afterwards.
 if [ -n "$shm" ]; then
 	# shm_open(3) needs the leading slash; 9vm creates with O_EXCL, so a
 	# stale region from a previous run would make it fail.

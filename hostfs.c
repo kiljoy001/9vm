@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <pthread.h>
 
 static pthread_mutex_t display_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -135,6 +136,45 @@ static void free_fid(struct hostfs *h, uint32_t fid) {
     }
 }
 
+/*
+ * The export root carries a virtual `time' file.  It has no bytes on the
+ * host: every read formats the host's clock, so a guest without an RTC
+ * (all of them here) can set /dev/time at boot and then keep checking it
+ * instead of drifting away from the machine that runs it.  Microseconds
+ * since the Unix epoch, one decimal number and a newline.
+ */
+static int time_file(struct hostfs *h, const char *path) {
+    char want[PATH_MAX];
+
+    if (!h->serve_time)
+        return 0;
+    if (snprintf(want, sizeof want, "%s/time", h->root_dir) >= (int)sizeof want)
+        return 0;
+    return strcmp(path, want) == 0;
+}
+
+static int time_text(char *buf, size_t size) {
+    struct timespec ts;
+
+    if (clock_gettime(CLOCK_REALTIME, &ts) < 0)
+        return 0;
+    return snprintf(buf, size, "%lld\n",
+                    (long long)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000);
+}
+
+static void time_stat(struct stat *st) {
+    char text[32];
+    int length = time_text(text, sizeof text);
+
+    memset(st, 0, sizeof *st);
+    st->st_mode = S_IFREG | 0444;
+    st->st_nlink = 1;
+    st->st_ino = 0x74696d65;        /* "time" */
+    st->st_size = length > 0 ? length : 0;
+    st->st_mtime = time(NULL);
+    st->st_atime = st->st_ctime = st->st_mtime;
+}
+
 void hostfs_init(struct hostfs *h, const char *root_dir) {
     memset(h, 0, sizeof(*h));
     h->msize = 65560;
@@ -184,6 +224,10 @@ int hostfs_set_boot_override(struct hostfs *h, const char *path) {
 
 void hostfs_set_display(struct hostfs *h, struct vmdisplay *display) {
     h->display = display;
+}
+
+void hostfs_set_time(struct hostfs *h, int on) {
+    h->serve_time = on;
 }
 
 static int display_control(struct vmdisplay *d, const uint8_t *data, uint32_t count,
@@ -463,7 +507,9 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
 
             struct stat st;
             if (stat(next_path, &st) < 0) {
-                break;
+                if (!time_file(h, next_path))
+                    break;
+                time_stat(&st);
             }
 
             qid_bytes[nwqid * 13 + 0] = S_ISDIR(st.st_mode) ? QTDIR : QTFILE;
@@ -494,7 +540,10 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
          */
         if (nwqid > 0 || nwname == 0) {
             strncpy(nf->path, cur_path, sizeof(nf->path) - 1);
-            stat(nf->path, &nf->st);
+            if (time_file(h, nf->path))
+                time_stat(&nf->st);
+            else
+                stat(nf->path, &nf->st);
         }
 
         uint32_t rsize = 4 + 1 + 2 + 2 + nwqid * 13;
@@ -522,11 +571,17 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
              (mode & 16) != 0))
             return send_rerror(tag, "bad display device mode", resp, resp_max);
 
-        if (stat(f->path, &f->st) < 0)
+        int virt = time_file(h, f->path);
+        if (virt && ((mode & 3) != 0 || (mode & 16) != 0))
+            return send_rerror(tag, "time is read only", resp, resp_max);
+
+        if (virt)
+            time_stat(&f->st);
+        else if (stat(f->path, &f->st) < 0)
             return send_rerror(tag, strerror(errno), resp, resp_max);
 
-        if (!image_path_allowed(h, f->path) ||
-            (h->only_file[0] != '\0' && (mode & 16) != 0))
+        if (!virt && (!image_path_allowed(h, f->path) ||
+                      (h->only_file[0] != '\0' && (mode & 16) != 0)))
             return send_rerror(tag, "image access denied", resp, resp_max);
 
         int flags = O_RDONLY;
@@ -538,11 +593,14 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         }
         if (mode & 16) flags |= O_TRUNC;
 
-        if (S_ISDIR(f->st.st_mode)) {
+        if (virt) {
+            /* No host descriptor: every read formats the clock. */
+        } else if (S_ISDIR(f->st.st_mode)) {
             f->dir = opendir(f->path);
             if (!f->dir) return send_rerror(tag, strerror(errno), resp, resp_max);
             f->diroffset = 0;
             f->direof = 0;
+            f->listed_time = 0;
             f->dirent = NULL;
         } else {
             if (h->only_file[0] != '\0')
@@ -654,6 +712,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                         rewinddir(f->dir);
                         f->diroffset = 0;
                         f->direof = 0;
+                        f->listed_time = 0;
                         f->dirent = NULL;
                     } else {
                         return send_rerror(tag, "bad directory offset", resp, resp_max);
@@ -672,6 +731,13 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                         }
                     }
                     if (strcmp(f->dirent->d_name, ".") == 0 || strcmp(f->dirent->d_name, "..") == 0) {
+                        f->dirent = NULL;
+                        continue;
+                    }
+                    /* A real file named time would shadow nothing: the
+                     * read is synthesised, so list the virtual one only. */
+                    if (h->serve_time && strcmp(f->path, h->root_dir) == 0 &&
+                        strcmp(f->dirent->d_name, "time") == 0) {
                         f->dirent = NULL;
                         continue;
                     }
@@ -695,6 +761,18 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                     f->dirent = NULL;
                 }
 
+                if (f->direof && h->serve_time && !f->listed_time &&
+                    strcmp(f->path, h->root_dir) == 0) {
+                    struct stat st;
+                    int encoded;
+                    time_stat(&st);
+                    encoded = encode_stat(p, (int)(ep - p), &st, "time");
+                    if (encoded > 0) {
+                        p += encoded;
+                        f->listed_time = 1;
+                    }
+                }
+
                 actual_read = (uint32_t)(p - (resp + 11));
                 f->diroffset += actual_read;
             }
@@ -715,6 +793,16 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                     actual_read = length;
                     __atomic_store_n(&d->input_tail, tail + 1, __ATOMIC_RELEASE);
                 }
+            }
+        } else if (time_file(h, f->path)) {
+            char text[32];
+            int length = time_text(text, sizeof text);
+            if (length > 0 && offset < (uint64_t)length) {
+                uint32_t avail = (uint32_t)length - (uint32_t)offset;
+                if (avail > count)
+                    avail = count;
+                memcpy(resp + 11, text + (size_t)offset, avail);
+                actual_read = avail;
             }
         } else {
             if (f->fd >= 0) {
@@ -737,6 +825,8 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
 
         struct hostfs_fid *f = find_fid(h, fid);
         if (!f) return send_rerror(tag, "unknown fid", resp, resp_max);
+        if (time_file(h, f->path))
+            return send_rerror(tag, "time is read only", resp, resp_max);
         if (f->fd < 0) return send_rerror(tag, "bad fid for write", resp, resp_max);
 
         uint32_t actual_write = 0;
@@ -788,6 +878,8 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         if (!f) return send_rerror(tag, "unknown fid", resp, resp_max);
         if (display_file(h, f->path) != DisplayNone)
             return send_rerror(tag, "display device cannot be removed", resp, resp_max);
+        if (time_file(h, f->path))
+            return send_rerror(tag, "time cannot be removed", resp, resp_max);
 
         if (S_ISDIR(f->st.st_mode)) {
             rmdir(f->path);
@@ -808,7 +900,9 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         struct hostfs_fid *f = find_fid(h, fid);
         if (!f) return send_rerror(tag, "unknown fid", resp, resp_max);
 
-        if (stat(f->path, &f->st) < 0)
+        if (time_file(h, f->path))
+            time_stat(&f->st);
+        else if (stat(f->path, &f->st) < 0)
             return send_rerror(tag, strerror(errno), resp, resp_max);
 
         const char *basename = strrchr(f->path, '/');

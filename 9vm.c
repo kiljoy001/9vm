@@ -2109,6 +2109,8 @@ int main(int argc, char **argv) {
         }
     } else
         hostfs_init(&hostfs_inst, root_dir);
+    if (!isolated_gefs_root)
+        hostfs_set_time(&hostfs_inst, 1);
     struct hostfs *diskfs_inst = NULL;
     if (gefs_image != NULL) {
         diskfs_inst = calloc(1, sizeof(*diskfs_inst));
@@ -2300,6 +2302,7 @@ int main(int argc, char **argv) {
         }
         hostfs_init(hostring_fs, root_dir);
         hostfs_set_display(hostring_fs, vm_display);
+        hostfs_set_time(hostring_fs, 1);
         if (boot_override != NULL &&
             hostfs_set_boot_override(hostring_fs, boot_override) < 0) {
             fprintf(stderr, "[9vm] Invalid hostring boot override\n");
