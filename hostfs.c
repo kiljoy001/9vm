@@ -90,10 +90,32 @@ hostfs_trace(void)
     return trace;
 }
 
+/* Closes what an open fid holds, so it can be opened or reused afresh. */
+static void close_fid(struct hostfs_fid *f) {
+    if (f->fd >= 0) close(f->fd);
+    if (f->dir) closedir(f->dir);
+    f->fd = -1;
+    f->dir = NULL;
+    f->dirent = NULL;
+    f->omode = -1;
+}
+
+/* A fid number the client names as new.  One still held from before (a
+ * partial walk's newfid, or a session the client has since dropped) starts
+ * again empty: its old descriptor or directory must not answer for the
+ * file it now names. */
 static struct hostfs_fid *alloc_fid(struct hostfs *h, uint32_t fid) {
     static int allocs;
     struct hostfs_fid *f = find_fid(h, fid);
-    if (f) return f;
+    if (f) {
+        close_fid(f);
+        memset(f, 0, sizeof(*f));
+        f->in_use = 1;
+        f->fid = fid;
+        f->fd = -1;
+        f->omode = -1;
+        return f;
+    }
     for (int i = 0; i < HOSTFS_MAX_FIDS; i++) {
         if (!h->fids[i].in_use) {
             memset(&h->fids[i], 0, sizeof(h->fids[i]));
@@ -130,10 +152,21 @@ static struct hostfs_fid *alloc_fid(struct hostfs *h, uint32_t fid) {
 static void free_fid(struct hostfs *h, uint32_t fid) {
     struct hostfs_fid *f = find_fid(h, fid);
     if (f) {
-        if (f->fd >= 0) close(f->fd);
-        if (f->dir) closedir(f->dir);
+        close_fid(f);
         memset(f, 0, sizeof(*f));
     }
+}
+
+/* A name the client gives for one path element.  It must name a single
+ * entry of the directory: a '/' or a NUL in it, or a name too long for
+ * the buffer, would let the joined host path leave the export. */
+static int element_ok(const uint8_t *p, uint16_t len, char *out, size_t size) {
+    if (len == 0 || len >= size || memchr(p, '/', len) != NULL ||
+        memchr(p, '\0', len) != NULL)
+        return 0;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 1;
 }
 
 /*
@@ -386,13 +419,30 @@ static int encode_stat(uint8_t *buf, int maxlen, const struct stat *st, const ch
 
 uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                          uint8_t *resp, uint32_t resp_max) {
-    if (req_len < 7) return 0;
+    if (req_len < 7 || resp_max < 7) return 0;
 
     uint32_t msg_len = *(uint32_t *)(req + 0);
-    if (msg_len > req_len) return 0;
+    if (msg_len < 7 || msg_len > req_len) return 0;
+    /* The message, not the buffer that carries it, bounds every field. */
+    req_len = msg_len;
 
     uint8_t type = req[4];
     uint16_t tag = *(uint16_t *)(req + 5);
+
+    /* The fixed part of each request, which the cases below read
+     * without looking further. */
+    uint32_t fixed = 7;
+    switch (type) {
+    case Tversion: case Tattach: case Tclunk: case Tremove: case Tstat:
+        fixed = 11; break;
+    case Topen: fixed = 12; break;
+    case Tcreate: fixed = 13; break;
+    case Twalk: fixed = 17; break;
+    case Tread: case Twrite: fixed = 23; break;
+    case Twstat: fixed = 13; break;
+    }
+    if (req_len < fixed)
+        return send_rerror(tag, "short 9P message", resp, resp_max);
 
     switch (type) {
     case Tversion: {
@@ -447,18 +497,22 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         uint32_t newfid = *(uint32_t *)(req + 11);
         uint16_t nwname = *(uint16_t *)(req + 15);
 
+        /* walk(5): at most MAXWELEM elements, a qid for each. */
+        if (nwname > HOSTFS_MAXWELEM)
+            return send_rerror(tag, "too many path elements", resp, resp_max);
+
         struct hostfs_fid *oldf = find_fid(h, fid);
         if (!oldf) return send_rerror(tag, "unknown fid", resp, resp_max);
 
-        struct hostfs_fid *nf = alloc_fid(h, newfid);
-        if (!nf) return send_rerror(tag, "out of fids", resp, resp_max);
-
         char cur_path[PATH_MAX];
-        strncpy(cur_path, oldf->path, sizeof(cur_path) - 1);
+        snprintf(cur_path, sizeof cur_path, "%s", oldf->path);
+
+        struct hostfs_fid *nf = newfid == fid ? oldf : alloc_fid(h, newfid);
+        if (!nf) return send_rerror(tag, "out of fids", resp, resp_max);
 
         uint16_t nwqid = 0;
         const uint8_t *p = req + 17;
-        uint8_t qid_bytes[16 * 13];
+        uint8_t qid_bytes[HOSTFS_MAXWELEM * 13];
 
         for (int i = 0; i < nwname; i++) {
             if (p + 2 > req + msg_len) break;
@@ -466,9 +520,8 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
             if (p + wlen > req + msg_len) break;
 
             char elem[256];
-            int copylen = wlen < 255 ? wlen : 255;
-            memcpy(elem, p, copylen);
-            elem[copylen] = '\0';
+            if (!element_ok(p, wlen, elem, sizeof elem))
+                break;
             p += wlen;
 
             char next_path[PATH_MAX];
@@ -493,8 +546,9 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
                         next_path[1] = '\0';
                     }
                 }
-            } else {
-                snprintf(next_path, sizeof(next_path), "%s/%s", cur_path, elem);
+            } else if (snprintf(next_path, sizeof(next_path), "%s/%s", cur_path, elem) >=
+                       (int)sizeof(next_path)) {
+                break;
             }
             if (h->boot_override[0] != '\0' && strcmp(elem, "boot") == 0 &&
                 strlen(cur_path) == strlen(h->root_dir) + 5 &&
@@ -522,7 +576,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         if (nwname > 0 && nwqid == 0) {
             /* 9P: a failed first element is Rwalk with zero qids, not an
              * error, and the new fid is not created. */
-            if (newfid != fid) free_fid(h, newfid);
+            if (nf != oldf) free_fid(h, newfid);
             uint32_t rsize = 4 + 1 + 2 + 2;
             if (rsize > resp_max) return 0;
             *(uint32_t *)(resp + 0) = rsize;
@@ -539,7 +593,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
          * continuation resolve from "/" and leaked the fid.
          */
         if (nwqid > 0 || nwname == 0) {
-            strncpy(nf->path, cur_path, sizeof(nf->path) - 1);
+            snprintf(nf->path, sizeof(nf->path), "%s", cur_path);
             if (time_file(h, nf->path))
                 time_stat(&nf->st);
             else
@@ -596,6 +650,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         if (virt) {
             /* No host descriptor: every read formats the clock. */
         } else if (S_ISDIR(f->st.st_mode)) {
+            close_fid(f);
             f->dir = opendir(f->path);
             if (!f->dir) return send_rerror(tag, strerror(errno), resp, resp_max);
             f->diroffset = 0;
@@ -605,6 +660,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         } else {
             if (h->only_file[0] != '\0')
                 flags |= O_DSYNC;
+            close_fid(f);
             f->fd = open(f->path, flags);
             if (f->fd < 0) return send_rerror(tag, strerror(errno), resp, resp_max);
         }
@@ -626,22 +682,30 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
             return send_rerror(tag, "image export is fixed", resp, resp_max);
         uint32_t fid = *(uint32_t *)(req + 7);
         uint16_t namelen = *(uint16_t *)(req + 11);
+        if ((uint32_t)13 + namelen + 5 > req_len)
+            return send_rerror(tag, "short 9P message", resp, resp_max);
         char name[256];
-        int copylen = namelen < 255 ? namelen : 255;
-        memcpy(name, req + 13, copylen);
-        name[copylen] = '\0';
+        if (!element_ok(req + 13, namelen, name, sizeof name) ||
+            strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+            return send_rerror(tag, "bad file name", resp, resp_max);
 
         uint32_t perm = *(uint32_t *)(req + 13 + namelen);
         uint8_t mode = req[13 + namelen + 4];
 
         struct hostfs_fid *f = find_fid(h, fid);
         if (!f) return send_rerror(tag, "unknown fid", resp, resp_max);
+        if (!S_ISDIR(f->st.st_mode))
+            return send_rerror(tag, "create in a non-directory", resp, resp_max);
 
         char new_path[PATH_MAX];
-        snprintf(new_path, sizeof(new_path), "%s/%s", f->path, name);
+        if (snprintf(new_path, sizeof(new_path), "%s/%s", f->path, name) >= (int)sizeof(new_path))
+            return send_rerror(tag, "file name too long", resp, resp_max);
         if (display_file(h, new_path) != DisplayNone)
             return send_rerror(tag, "display device is fixed", resp, resp_max);
+        if (time_file(h, new_path))
+            return send_rerror(tag, "time is fixed", resp, resp_max);
 
+        close_fid(f);
         if (perm & 0x80000000) { /* DMDIR */
             if (mkdir(new_path, perm & 0777) < 0)
                 return send_rerror(tag, strerror(errno), resp, resp_max);
@@ -688,6 +752,8 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
             display_file(h, f->path) != DisplayInput)
             return send_rerror(tag, "display device is write only", resp, resp_max);
 
+        if (resp_max < 11)
+            return 0;
         uint32_t max_read = resp_max - 11;
         if (count > max_read) count = max_read;
 
@@ -830,7 +896,7 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
         if (f->fd < 0) return send_rerror(tag, "bad fid for write", resp, resp_max);
 
         uint32_t actual_write = 0;
-        if (req_len >= 23 + count) {
+        if (count <= req_len - 23) {
             int kind = display_file(h, f->path);
             if (kind == DisplayCtl) {
                 int nw = display_control(h->display, req + 23, count, offset);
@@ -926,7 +992,92 @@ uint32_t hostfs_dispatch(struct hostfs *h, const uint8_t *req, uint32_t req_len,
     case Twstat: {
         if (h->only_file[0] != '\0')
             return send_rerror(tag, "image export is fixed", resp, resp_max);
-        /* Accept stat update */
+        uint32_t fid = *(uint32_t *)(req + 7);
+        struct hostfs_fid *f = find_fid(h, fid);
+        if (!f) return send_rerror(tag, "unknown fid", resp, resp_max);
+        if (display_file(h, f->path) != DisplayNone || time_file(h, f->path))
+            return send_rerror(tag, "device files are fixed", resp, resp_max);
+        if (stat(f->path, &f->st) < 0)
+            return send_rerror(tag, strerror(errno), resp, resp_max);
+
+        /* stat(5) after nstat[2]: size[2] type[2] dev[4] qid[13] mode[4]
+         * atime[4] mtime[4] length[8] name[s] uid[s] gid[s] muid[s]; a
+         * field of all ones, or an empty name, asks for no change. */
+        const uint8_t *s = req + 13;
+        if (req_len < 13 + 43)
+            return send_rerror(tag, "short 9P message", resp, resp_max);
+        uint32_t mode, mtime;
+        uint64_t length;
+        uint16_t nlen;
+        memcpy(&mode, s + 21, 4);
+        memcpy(&mtime, s + 29, 4);
+        memcpy(&length, s + 33, 8);
+        memcpy(&nlen, s + 41, 2);
+        if ((uint32_t)13 + 43 + nlen > req_len)
+            return send_rerror(tag, "short 9P message", resp, resp_max);
+
+        /* Check every change before making any, so a refused wstat
+         * changes nothing. */
+        char new_path[PATH_MAX];
+        new_path[0] = '\0';
+        if (nlen > 0) {
+            char name[256];
+            const char *slash = strrchr(f->path, '/');
+            if (!element_ok(s + 43, nlen, name, sizeof name) ||
+                strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+                return send_rerror(tag, "bad file name", resp, resp_max);
+            if (slash == NULL || strcmp(slash + 1, name) != 0) {
+                struct stat other;
+                if (strcmp(f->path, h->root_dir) == 0 || slash == NULL)
+                    return send_rerror(tag, "the root cannot be renamed", resp, resp_max);
+                if ((int)(slash - f->path) + 1 + nlen >= (int)sizeof new_path)
+                    return send_rerror(tag, "file name too long", resp, resp_max);
+                snprintf(new_path, sizeof new_path, "%.*s/%s",
+                         (int)(slash - f->path), f->path, name);
+                if (display_file(h, new_path) != DisplayNone || time_file(h, new_path))
+                    return send_rerror(tag, "device files are fixed", resp, resp_max);
+                if (lstat(new_path, &other) == 0)
+                    return send_rerror(tag, "file already exists", resp, resp_max);
+            }
+        }
+        if (mode != 0xFFFFFFFFU &&
+            ((mode & 0x80000000U) != 0) != (S_ISDIR(f->st.st_mode) != 0))
+            return send_rerror(tag, "cannot change a file's directory bit", resp, resp_max);
+        if (length != ~0ULL && S_ISDIR(f->st.st_mode) && length != 0)
+            return send_rerror(tag, "cannot set a directory's length", resp, resp_max);
+
+        if (length != ~0ULL && !S_ISDIR(f->st.st_mode) &&
+            truncate(f->path, (off_t)length) < 0)
+            return send_rerror(tag, strerror(errno), resp, resp_max);
+        if (mode != 0xFFFFFFFFU && chmod(f->path, mode & 0777) < 0)
+            return send_rerror(tag, strerror(errno), resp, resp_max);
+        if (mtime != 0xFFFFFFFFU) {
+            struct timespec times[2] = {
+                { .tv_sec = 0, .tv_nsec = UTIME_OMIT },
+                { .tv_sec = (time_t)mtime, .tv_nsec = 0 },
+            };
+            if (utimensat(AT_FDCWD, f->path, times, 0) < 0)
+                return send_rerror(tag, strerror(errno), resp, resp_max);
+        }
+        if (new_path[0] != '\0') {
+            char old_path[PATH_MAX];
+            size_t old_len = strlen(f->path);
+            snprintf(old_path, sizeof old_path, "%s", f->path);
+            if (rename(old_path, new_path) < 0)
+                return send_rerror(tag, strerror(errno), resp, resp_max);
+            /* Every fid on the file, or inside it, follows it. */
+            for (int i = 0; i < HOSTFS_MAX_FIDS; i++) {
+                struct hostfs_fid *g = &h->fids[i];
+                char moved[PATH_MAX];
+                if (!g->in_use || strncmp(g->path, old_path, old_len) != 0 ||
+                    (g->path[old_len] != '\0' && g->path[old_len] != '/'))
+                    continue;
+                if (snprintf(moved, sizeof moved, "%s%s", new_path, g->path + old_len) <
+                    (int)sizeof moved)
+                    snprintf(g->path, sizeof g->path, "%s", moved);
+            }
+        }
+
         uint32_t rsize = 4 + 1 + 2;
         if (rsize > resp_max) return 0;
         *(uint32_t *)(resp + 0) = rsize;

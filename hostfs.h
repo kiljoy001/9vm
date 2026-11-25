@@ -9,6 +9,7 @@
 #include "vmdisplay.h"
 
 #define HOSTFS_MAX_FIDS 1024
+#define HOSTFS_MAXWELEM 16	/* walk(5)'s MAXWELEM */
 
 struct hostfs_fid {
     int in_use;

@@ -6,3 +6,4 @@ build/
 9vm-arm64
 kvm-arm64-smoke
 kvm-arm64-probe
+test_hostfs

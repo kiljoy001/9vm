@@ -72,10 +72,12 @@ static int display_init(const char *name) {
     if (name[0] != '/' || name[1] == '\0' || strchr(name + 1, '/') != NULL ||
         strlen(name) >= sizeof vm_display_name)
         return -1;
-    snprintf(vm_display_name, sizeof vm_display_name, "%s", name);
     vm_display_fd = shm_open(name, O_CREAT | O_EXCL | O_RDWR, 0600);
     if (vm_display_fd < 0)
         return -1;
+    /* Only a name this VM made is unlinked at exit; one already in use
+     * belongs to another VM's display. */
+    snprintf(vm_display_name, sizeof vm_display_name, "%s", name);
     if (ftruncate(vm_display_fd, VMDISPLAY_GUEST_SIZE) < 0)
         return -1;
     vm_display = mmap(NULL, VMDISPLAY_GUEST_SIZE, PROT_READ | PROT_WRITE,
@@ -341,13 +343,53 @@ static void ns_deliver(const uint8_t *msg, uint32_t len) {
     ns_complete(i, msg, len);
 }
 
+/* Reads what the server has sent and delivers each whole reply. */
+static void ns_read(void) {
+    ssize_t n = read(ns_fd, ns_rbuf + ns_rlen, sizeof ns_rbuf - ns_rlen);
+    if (n > 0) {
+        ns_rlen += n;
+        for (;;) {
+            uint32_t len;
+            if (ns_rlen < 4)
+                break;
+            len = ns_rbuf[0] | ns_rbuf[1] << 8 | ns_rbuf[2] << 16 | (uint32_t)ns_rbuf[3] << 24;
+            if (len < 7 || len > P9_HOST_MSIZE) {
+                ns_drop("ns: bad message from the server");
+                break;
+            }
+            if (ns_rlen < len)
+                break;
+            ns_deliver(ns_rbuf, len);
+            memmove(ns_rbuf, ns_rbuf + len, ns_rlen - len);
+            ns_rlen -= len;
+        }
+    } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
+        ns_drop("ns: connection closed");
+    }
+}
+
+/* Writes a request.  The socket does not block: while the server cannot
+ * take more, its replies are read, or a server blocked writing replies
+ * and this thread blocked writing requests would wait on each other. */
 static int ns_send(const uint8_t *p, size_t n) {
     while (n > 0) {
         ssize_t w = write(ns_fd, p, n);
         if (w < 0) {
+            struct pollfd pfd = { .fd = ns_fd, .events = POLLIN | POLLOUT, .revents = 0 };
             if (errno == EINTR)
                 continue;
-            return -1;
+            if (errno != EAGAIN)
+                return -1;
+            if (poll(&pfd, 1, 1000) < 0 && errno != EINTR)
+                return -1;
+            if (pfd.revents & (POLLIN | POLLHUP | POLLERR)) {
+                ns_read();
+                if (ns_fd < 0)
+                    return -1;
+            }
+            if (!__atomic_load_n(&ns_running, __ATOMIC_ACQUIRE))
+                return -1;
+            continue;
         }
         p += w;
         n -= w;
@@ -364,14 +406,17 @@ static void *ns_serve(void *arg) {
     while (__atomic_load_n(&ns_running, __ATOMIC_ACQUIRE)) {
         int worked = 0;
         while (p9_tring_consume(&hostring->ns.t_ring, &slot)) {
-            P9HostBuffer *b;
+            P9HostBuffer *b = NULL;
             uint32_t wirelen = 0;
             worked = 1;
             if (slot.buf_addr < P9_HOST_SLOTS && slot.count >= 7 && slot.count <= P9_HOST_MSIZE) {
                 b = &hostring->nsbuffer[slot.buf_addr];
                 memcpy(&wirelen, b->request, sizeof wirelen);
             }
-            if (wirelen != slot.count || b->request[4] != slot.type ||
+            /* A slot outside the buffers, or one already waiting on the
+             * server, is refused; the guest owns the ring's contents. */
+            if (b == NULL || ns_out[slot.buf_addr].busy || wirelen != slot.count ||
+                b->request[4] != slot.type ||
                 b->request[5] != (uint8_t)slot.tag || b->request[6] != (uint8_t)(slot.tag >> 8)) {
                 memset(&comp, 0, sizeof comp);
                 comp.tag = slot.tag;
@@ -386,38 +431,20 @@ static void *ns_serve(void *arg) {
             ns_out[slot.buf_addr].tag = slot.tag;
             ns_out[slot.buf_addr].oldtag = slot.type == P9_TFLUSH && slot.count >= 9
                 ? (uint16_t)(b->request[7] | (b->request[8] << 8)) : P9_NOTAG;
-            if (ns_fd < 0 && (ns_fd = ns_dial(ns_addr)) < 0) {
-                ns_fail(slot.buf_addr, slot.tag, "ns: cannot reach the server");
-                continue;
+            if (ns_fd < 0) {
+                if ((ns_fd = ns_dial(ns_addr)) < 0) {
+                    ns_fail(slot.buf_addr, slot.tag, "ns: cannot reach the server");
+                    continue;
+                }
+                fcntl(ns_fd, F_SETFL, fcntl(ns_fd, F_GETFL) | O_NONBLOCK);
             }
             if (ns_send(b->request, slot.count) < 0)
                 ns_drop("ns: connection lost");
         }
         if (ns_fd >= 0) {
             struct pollfd pfd = { .fd = ns_fd, .events = POLLIN, .revents = 0 };
-            if (poll(&pfd, 1, worked ? 0 : 1) > 0) {
-                ssize_t n = read(ns_fd, ns_rbuf + ns_rlen, sizeof ns_rbuf - ns_rlen);
-                if (n > 0) {
-                    ns_rlen += n;
-                    for (;;) {
-                        uint32_t len;
-                        if (ns_rlen < 4)
-                            break;
-                        len = ns_rbuf[0] | ns_rbuf[1] << 8 | ns_rbuf[2] << 16 | (uint32_t)ns_rbuf[3] << 24;
-                        if (len < 7 || len > P9_HOST_MSIZE) {
-                            ns_drop("ns: bad message from the server");
-                            break;
-                        }
-                        if (ns_rlen < len)
-                            break;
-                        ns_deliver(ns_rbuf, len);
-                        memmove(ns_rbuf, ns_rbuf + len, ns_rlen - len);
-                        ns_rlen -= len;
-                    }
-                } else if (n == 0 || (errno != EINTR && errno != EAGAIN)) {
-                    ns_drop("ns: connection closed");
-                }
-            }
+            if (poll(&pfd, 1, worked ? 0 : 1) > 0)
+                ns_read();
         } else if (!worked) {
             nanosleep(&rest, NULL);
         }
@@ -556,7 +583,8 @@ static uint64_t load_elf(const char *path, uint8_t *ram, size_t ram_size) {
                 continue;
 
             uint32_t paddr = phdrs[i].p_paddr;
-            if (paddr + phdrs[i].p_memsz > ram_size) {
+            if ((uint64_t)paddr + phdrs[i].p_memsz > ram_size ||
+                phdrs[i].p_filesz > phdrs[i].p_memsz) {
                 fprintf(stderr, "kernel segment exceeds guest RAM (0x%x + 0x%x > 0x%zx)\n",
                         paddr, phdrs[i].p_memsz, ram_size);
                 exit(1);
@@ -605,11 +633,15 @@ static uint64_t load_elf(const char *path, uint8_t *ram, size_t ram_size) {
             if (paddr >= 0xFFFF800000000000ULL)
                 paddr = paddr & 0x000000003FFFFFFFULL;
 
-            if (paddr + phdrs[i].p_memsz > ram_size) {
+            if (phdrs[i].p_memsz > ram_size || paddr > ram_size - phdrs[i].p_memsz ||
+                phdrs[i].p_filesz > phdrs[i].p_memsz) {
                 fprintf(stderr, "kernel segment exceeds guest RAM (0x%lx + 0x%lx > 0x%zx)\n",
                         paddr, phdrs[i].p_memsz, ram_size);
                 exit(1);
             }
+
+            if (paddr + phdrs[i].p_memsz > kernel_end_pa)
+                kernel_end_pa = paddr + phdrs[i].p_memsz;
 
             lseek(fd, phdrs[i].p_offset, SEEK_SET);
             if (read(fd, ram + paddr, phdrs[i].p_filesz) != (ssize_t)phdrs[i].p_filesz) {
@@ -1023,48 +1055,10 @@ static void pci_io_read(struct pci_dev *p_host, struct pci_dev *p_net, struct pc
 struct virtio_9p {
     uint8_t  bar0[VIRTIO_BAR0_SIZE];
     uint16_t last_avail_idx;
-    int      srv_fd;
     struct hostfs *hostfs;
     uint32_t irq;
     uint64_t bar_addr;
-    void    *async_ctx;
 };
-
-/*
- * The network 9P service blocks a read until socket data is available.  A
- * synchronous virtio-9p handler would therefore stop the vCPU while an
- * application waits for a packet.  The net device instead has a writer and
- * a reader thread: requests are copied out of guest memory, handed to the
- * service, and completed on the used ring whenever the reply arrives.
- */
-struct v9_request {
-    struct v9_request *next;
-    uint16_t head;
-    uint16_t tag;
-    uint8_t *req;
-    uint32_t req_len;
-    uint64_t resp_gpa;
-    uint32_t resp_max;
-};
-
-struct v9_async {
-    struct virtio_9p *v9;
-    int vm;
-    uint8_t *ram;
-    size_t ram_size;
-    int fd;
-    pthread_t writer;
-    pthread_t reader;
-    pthread_mutex_t lock;
-    pthread_cond_t cond;
-    struct v9_request *queue_head;
-    struct v9_request *queue_tail;
-    struct v9_request *pending;
-    int stop;
-};
-
-static void *virtio_9p_async_writer(void *arg);
-static void *virtio_9p_async_reader(void *arg);
 
 #define VIRTIO_NET_BAR0_ADDR 0xFEB01000ULL
 
@@ -1203,16 +1197,18 @@ vnet_tx(struct virtio_net *vn) {
         if (getenv("VM_TRACE_NET"))
             fprintf(stderr, "[vnet] tx head=%u flags=%#x next=%u l0=%u\n",
                     head, flags0, next0, l0);
-        if ((flags0 & 1) == 0 || next0 >= qsize)
-            continue;
-        d1 = vnet_u64(vn, desc_pa + next0 * 16);
-        l1 = vnet_u32(vn, desc_pa + next0 * 16 + 8);
-        if (l0 < 12 || l1 == 0 || l1 > 2048 ||
-            !vnet_range(vn, d0, 12) || !vnet_range(vn, d1, l1))
-            continue;
-        ssize_t n = write(vn->tapfd, vn->ram + d1, l1);
-        if (n < 0 && errno == EAGAIN)
-            ; /* drop under host backpressure */
+        /* A chain that is not header + frame is completed unsent, as on
+         * rx, so the guest gets its descriptors back. */
+        if ((flags0 & 1) != 0 && next0 < qsize) {
+            d1 = vnet_u64(vn, desc_pa + next0 * 16);
+            l1 = vnet_u32(vn, desc_pa + next0 * 16 + 8);
+            if (l0 >= 12 && l1 != 0 && l1 <= 2048 &&
+                vnet_range(vn, d0, 12) && vnet_range(vn, d1, l1)) {
+                ssize_t n = write(vn->tapfd, vn->ram + d1, l1);
+                if (n < 0 && errno == EAGAIN)
+                    ; /* drop under host backpressure */
+            }
+        }
         vnet_used(vn, used_pa, qsize, head, 0);
         vnet_irq(vn);
     }
@@ -1390,7 +1386,8 @@ vnet_mmio_read(struct virtio_net *vn, uint64_t addr, uint8_t *data, uint32_t len
     if (off == 0x04) {
         uint32_t sel = *(uint32_t *)(vn->bar0 + 0x00);
         uint32_t feat = sel == 0 ? ((1u<<5)|(1u<<16)) : (sel == 1 ? 1u : 0u);
-        memcpy(data, &feat, len);
+        memset(data, 0, len);
+        memcpy(data, &feat, len < 4 ? len : 4);
         return;
     }
     if (off >= 0x300 && off < 0x310) {
@@ -1445,9 +1442,8 @@ vnet_init(struct virtio_net *vn, int vm, uint8_t *ram, size_t ram_size, int tapf
     vn->bar0[0x1a] = 0xff;
 }
 
-static void virtio_9p_init(struct virtio_9p *v9, int srv_fd, const char *tag, uint32_t irq, uint64_t bar_addr) {
+static void virtio_9p_init(struct virtio_9p *v9, const char *tag, uint32_t irq, uint64_t bar_addr) {
     memset(v9, 0, sizeof(*v9));
-    v9->srv_fd = srv_fd;
     v9->irq = irq;
     v9->bar_addr = bar_addr;
 
@@ -1474,156 +1470,11 @@ static inline int is_valid_ram_range(uint64_t addr, uint64_t len, size_t ram_siz
     return 1;
 }
 
-static int v9_write_full(int fd, const void *buf, size_t len) {
-    const uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t n = write(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0)
-            return -1;
-        p += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static int v9_read_full(int fd, void *buf, size_t len) {
-    uint8_t *p = buf;
-    while (len > 0) {
-        ssize_t n = read(fd, p, len);
-        if (n < 0) {
-            if (errno == EINTR)
-                continue;
-            return -1;
-        }
-        if (n == 0)
-            return -1;
-        p += n;
-        len -= (size_t)n;
-    }
-    return 0;
-}
-
-static void v9_async_complete(struct v9_async *a, struct v9_request *r,
-                              const uint8_t *resp, uint32_t len) {
-    struct virtio_9p *v9 = a->v9;
-    uint64_t used_ring_pa = *(uint64_t *)(v9->bar0 + 0x30);
-    uint16_t queue_size = *(uint16_t *)(v9->bar0 + 0x18);
-    if (queue_size == 0 || used_ring_pa >= a->ram_size ||
-        used_ring_pa + 4 + (uint64_t)queue_size * 8 + 2 > a->ram_size)
-        return;
-    uint32_t out_len = len;
-    if (resp == NULL || out_len > r->resp_max ||
-        !is_valid_ram_range(r->resp_gpa, out_len, a->ram_size))
-        out_len = 0;
-    if (out_len > 0)
-        memcpy(a->ram + r->resp_gpa, resp, out_len);
-    pthread_mutex_lock(&a->lock);
-    uint16_t used_idx = *(uint16_t *)(a->ram + used_ring_pa + 2);
-    uint16_t slot = used_idx % queue_size;
-    *(uint32_t *)(a->ram + used_ring_pa + 4 + slot * 8) = r->head;
-    *(uint32_t *)(a->ram + used_ring_pa + 4 + slot * 8 + 4) = out_len;
-    __sync_synchronize();
-    *(uint16_t *)(a->ram + used_ring_pa + 2) = used_idx + 1;
-    v9->bar0[0x200] |= 1;
-    pthread_mutex_unlock(&a->lock);
-    struct kvm_irq_level irq = { .irq = v9->irq, .level = 1 };
-    ioctl(a->vm, KVM_IRQ_LINE, &irq);
-}
-
-static void virtio_9p_async_kick(struct v9_async *a) {
-    struct virtio_9p *v9 = a->v9;
-    uint16_t queue_enable = *(uint16_t *)(v9->bar0 + 0x1C);
-    if (!queue_enable)
-        return;
-    uint64_t desc_table_pa = *(uint64_t *)(v9->bar0 + 0x20);
-    uint64_t avail_ring_pa = *(uint64_t *)(v9->bar0 + 0x28);
-    uint16_t queue_size = *(uint16_t *)(v9->bar0 + 0x18);
-    if (queue_size == 0 || queue_size > 32768)
-        return;
-    uint64_t desc_bytes = (uint64_t)queue_size * 16;
-    uint64_t avail_bytes = 4 + (uint64_t)queue_size * 2 + 2;
-    if (!is_valid_ram_range(desc_table_pa, desc_bytes, a->ram_size) ||
-        !is_valid_ram_range(avail_ring_pa, avail_bytes, a->ram_size))
-        return;
-    uint16_t avail_idx = *(uint16_t *)(a->ram + avail_ring_pa + 2);
-    while (v9->last_avail_idx != avail_idx) {
-        uint16_t ring_idx = v9->last_avail_idx % queue_size;
-        uint16_t head = *(uint16_t *)(a->ram + avail_ring_pa + 4 + ring_idx * 2);
-        v9->last_avail_idx++;
-        if (head >= queue_size)
-            continue;
-        uint16_t desc_idx = head;
-        uint8_t *req_buf = NULL;
-        uint32_t req_len = 0;
-        uint8_t *resp_buf = NULL;
-        uint32_t resp_max = 0;
-        int desc_ok = 1;
-        for (int i = 0; i < queue_size; i++) {
-            if (desc_idx >= queue_size) {
-                desc_ok = 0;
-                break;
-            }
-            uint64_t d_addr = *(uint64_t *)(a->ram + desc_table_pa + desc_idx * 16);
-            uint32_t d_len = *(uint32_t *)(a->ram + desc_table_pa + desc_idx * 16 + 8);
-            uint16_t d_flags = *(uint16_t *)(a->ram + desc_table_pa + desc_idx * 16 + 12);
-            uint16_t d_next = *(uint16_t *)(a->ram + desc_table_pa + desc_idx * 16 + 14);
-            if (!is_valid_ram_range(d_addr, d_len, a->ram_size)) {
-                desc_ok = 0;
-                break;
-            }
-            if (d_flags & 2) {
-                resp_buf = a->ram + d_addr;
-                resp_max = d_len;
-            } else {
-                req_buf = a->ram + d_addr;
-                req_len = d_len;
-            }
-            if (d_flags & 1)
-                desc_idx = d_next;
-            else
-                break;
-        }
-        if (!desc_ok || req_buf == NULL || resp_buf == NULL || req_len < 7)
-            continue;
-        struct v9_request *r = calloc(1, sizeof(*r));
-        if (r == NULL)
-            break;
-        r->req = malloc(req_len);
-        if (r->req == NULL) {
-            free(r);
-            break;
-        }
-        memcpy(r->req, req_buf, req_len);
-        r->req_len = req_len;
-        r->head = head;
-        r->tag = *(uint16_t *)(r->req + 5);
-        r->resp_gpa = (uint64_t)(resp_buf - a->ram);
-        r->resp_max = resp_max;
-        pthread_mutex_lock(&a->lock);
-        if (a->queue_tail != NULL)
-            a->queue_tail->next = r;
-        else
-            a->queue_head = r;
-        a->queue_tail = r;
-        pthread_cond_signal(&a->cond);
-        pthread_mutex_unlock(&a->lock);
-    }
-}
-
 static void virtio_9p_process_queue(int vm, uint8_t *ram, size_t ram_size, struct virtio_9p *v9) {
-    if (v9->async_ctx != NULL) {
-        virtio_9p_async_kick(v9->async_ctx);
-        return;
-    }
     if (v9->hostfs)
         virtio_host_kicks++;
     uint16_t queue_enable = *(uint16_t *)(v9->bar0 + 0x1C);
-    if (!queue_enable || (v9->srv_fd < 0 && !v9->hostfs))
+    if (!queue_enable || !v9->hostfs)
         return;
 
     uint64_t desc_table_pa = *(uint64_t *)(v9->bar0 + 0x20);
@@ -1702,40 +1553,15 @@ static void virtio_9p_process_queue(int vm, uint8_t *ram, size_t ram_size, struc
         }
 
         uint32_t resp_len = 0;
-        if (req_buf && resp_buf && req_len > 0) {
-            if (v9->hostfs) {
-                resp_len = hostfs_dispatch(v9->hostfs, req_buf, req_len, resp_buf, resp_max);
-            } else if (v9->srv_fd >= 0) {
-                ssize_t nw = write(v9->srv_fd, req_buf, req_len);
-                if (nw == (ssize_t)req_len) {
-                    uint32_t total_size = 0;
-                    ssize_t nr = read(v9->srv_fd, &total_size, 4);
-                    if (nr == 4 && total_size <= resp_max && total_size >= 4) {
-                        memcpy(resp_buf, &total_size, 4);
-                        size_t remaining = total_size - 4;
-                        size_t total_read = 4;
-                        while (remaining > 0) {
-                            size_t chunk = remaining;
-                            if (total_read + chunk > resp_max)
-                                break;
-                            nr = read(v9->srv_fd, resp_buf + total_read, chunk);
-                            if (nr <= 0) break;
-                            total_read += nr;
-                            remaining -= nr;
-                        }
-                        resp_len = total_read;
-                    } else {
-                        fprintf(stderr, "[9vm] 9p server invalid reply (size %u, max %u)\n", total_size, resp_max);
-                    }
-                }
-            }
-        }
+        if (req_buf && resp_buf && req_len > 0)
+            resp_len = hostfs_dispatch(v9->hostfs, req_buf, req_len, resp_buf, resp_max);
 
         /* Write to used ring */
         uint16_t used_idx = *(uint16_t *)(ram + used_ring_pa + 2);
         uint16_t used_slot = used_idx % queue_size;
         *(uint32_t *)(ram + used_ring_pa + 4 + used_slot * 8) = head;
         *(uint32_t *)(ram + used_ring_pa + 4 + used_slot * 8 + 4) = resp_len;
+        __sync_synchronize();
         *(uint16_t *)(ram + used_ring_pa + 2) = used_idx + 1;
 
         v9->last_avail_idx++;
@@ -1798,7 +1624,8 @@ static void virtio_9p_mmio_read(int vm, struct virtio_9p *v9,
         } else if (sel == 1) {
             feat = 1; /* bit 32: VIRTIO_F_VERSION_1 */
         }
-        memcpy(data, &feat, len);
+        memset(data, 0, len);
+        memcpy(data, &feat, len < 4 ? len : 4);
         return;
     }
 
@@ -1888,6 +1715,7 @@ static void virtio_blk_process_queue(int vm, uint8_t *ram, size_t ram_size, stru
         }
 
         uint8_t st = 2; /* VIRTIO_BLK_S_UNSUPP */
+        uint32_t written = 1;   /* the status byte, and the data of a read */
         if (desc_ok && ndesc >= 3 && dl[0] >= 16 && dl[2] >= 1) {
             uint8_t *hdr = d[0], *data = d[1], *status = d[2];
             uint32_t type = *(uint32_t *)(hdr + 0);
@@ -1900,6 +1728,8 @@ static void virtio_blk_process_queue(int vm, uint8_t *ram, size_t ram_size, stru
                         ? pread(vb->fd, data, nbytes, off)
                         : pwrite(vb->fd, data, nbytes, off);
                     st = (r == (ssize_t)nbytes) ? 0 : 1; /* OK : IOERR */
+                    if (st == 0 && type == VIRTIO_BLK_T_IN)
+                        written += nbytes;
                 } else {
                     st = 1;
                 }
@@ -1913,7 +1743,8 @@ static void virtio_blk_process_queue(int vm, uint8_t *ram, size_t ram_size, stru
         uint16_t used_idx = *(uint16_t *)(ram + used_ring_pa + 2);
         uint16_t used_slot = used_idx % queue_size;
         *(uint32_t *)(ram + used_ring_pa + 4 + used_slot * 8) = head;
-        *(uint32_t *)(ram + used_ring_pa + 4 + used_slot * 8 + 4) = 1;
+        *(uint32_t *)(ram + used_ring_pa + 4 + used_slot * 8 + 4) = written;
+        __sync_synchronize();
         *(uint16_t *)(ram + used_ring_pa + 2) = used_idx + 1;
         vb->last_avail_idx++;
         did_work = 1;
@@ -1958,8 +1789,7 @@ static void virtio_blk_mmio_read(int vm, struct virtio_blk *vb,
         return;
     }
     if (offset == 0x04) {
-        uint32_t feat = 0;
-        memcpy(data, &feat, len);
+        memset(data, 0, len);   /* no features */
         return;
     }
     if (offset == 0x200) {
@@ -2003,11 +1833,6 @@ int main(int argc, char **argv) {
     bool legacy_host_root = false;
     bool isolated_gefs_root;
     char image_cmdline[256];
-    char netfs_default[PATH_MAX];
-    snprintf(netfs_default, sizeof(netfs_default), "/tmp/netfs.%ld.sock",
-             (long)getpid());
-    const char *netfs_path = netfs_default;
-    bool netfs_explicit = false;
     const char *net_tap = NULL;
     size_t ram_mb = DEFAULT_RAM_MB;
     bool use_hostring = true;
@@ -2036,8 +1861,7 @@ int main(int argc, char **argv) {
         } else if (strcmp(argv[i], "-u9fs") == 0 && i + 1 < argc) {
             i++; /* legacy u9fs option ignored: now in-process */
         } else if (strcmp(argv[i], "-netfs") == 0 && i + 1 < argc) {
-            netfs_path = argv[++i];
-            netfs_explicit = true;
+            i++; /* legacy netfs option ignored: networking is the kernel's #I */
         } else if (strcmp(argv[i], "-net-tap") == 0 && i + 1 < argc) {
             net_tap = argv[++i];
         } else if (strcmp(argv[i], "-ns") == 0 && i + 1 < argc) {
@@ -2052,7 +1876,7 @@ int main(int argc, char **argv) {
     }
 
     if (!kernel_path) {
-        fprintf(stderr, "Usage: %s [-m <mb>] [-c <cmdline>] [-r <root>] [-boot <guest>] [-display-shm <name>] [-display-root <dir>] [-netfs <sock>] [-net-tap <if>] [-ns <tcp!host!port|unix!path>] [-gefs-image <image>] [-initrd <file>] [-disk <image>] [-legacy-host-root] [-no9ring] <kernel-elf>\n", argv[0]);
+        fprintf(stderr, "Usage: %s [-m <mb>] [-c <cmdline>] [-r <root>] [-boot <guest>] [-display-shm <name>] [-display-root <dir>] [-net-tap <if>] [-ns <tcp!host!port|unix!path>] [-gefs-image <image>] [-initrd <file>] [-disk <image>] [-legacy-host-root] [-no9ring] <kernel-elf>\n", argv[0]);
         return 1;
     }
     isolated_gefs_root = gefs_image != NULL && boot_override == NULL && !legacy_host_root;
@@ -2063,6 +1887,11 @@ int main(int argc, char **argv) {
         }
         cmdline = image_cmdline;
         use_hostring = false;
+    }
+    /* setup_multiboot leaves 256 bytes for it before the memory map. */
+    if (strlen(cmdline) >= 256) {
+        fprintf(stderr, "[9vm] kernel command line longer than 255 bytes\n");
+        return 1;
     }
     if (display_name != NULL) {
         atexit(display_cleanup);
@@ -2137,14 +1966,6 @@ int main(int argc, char **argv) {
     if (net_tap != NULL && tapfd < 0)
         fprintf(stderr, "[9vm] Cannot open TAP '%s': %s\n", net_tap, strerror(errno));
 
-    int netfs_fd = netfs_explicit ? connect_unix_socket(netfs_path) : -1;
-    if (netfs_fd >= 0)
-        fprintf(stderr, "[9vm] Connected explicit virtio9p tag 'net' to '%s' (fd %d)\n", netfs_path, netfs_fd);
-    else if (netfs_explicit)
-        fprintf(stderr, "[9vm] Note: explicit netfs socket not found at '%s'; tag net idle\n", netfs_path);
-
-    if (getenv("VM_TRACE")) fprintf(stderr, "[perf +%.2f ms] netfs init\n", get_boot_ms());
-
     uint32_t pci_addr_reg = 0;
     struct pci_dev pci_9p_host;
     pci_dev_init(&pci_9p_host, 0x1049, 9, VIRTIO_9P_HOST_BAR0_ADDR, 10);
@@ -2163,12 +1984,12 @@ int main(int argc, char **argv) {
         pci_dev_init(&pci_9p_disk, 0x1049, 9, VIRTIO_9P_DISK_BAR0_ADDR, 12);
 
     struct virtio_9p v9_host;
-    virtio_9p_init(&v9_host, -1, "host", 10, VIRTIO_9P_HOST_BAR0_ADDR);
+    virtio_9p_init(&v9_host, "host", 10, VIRTIO_9P_HOST_BAR0_ADDR);
     v9_host.hostfs = &hostfs_inst;
 
     struct virtio_9p v9_disk;
     if (gefs_image != NULL) {
-        virtio_9p_init(&v9_disk, -1, "gefs-image", 12, VIRTIO_9P_DISK_BAR0_ADDR);
+        virtio_9p_init(&v9_disk, "gefs-image", 12, VIRTIO_9P_DISK_BAR0_ADDR);
         v9_disk.hostfs = diskfs_inst;
         fprintf(stderr, "[9vm] GEFS image exported as VirtIO 9P tag 'gefs-image' (#9/2)\n");
     }
@@ -2198,6 +2019,14 @@ int main(int argc, char **argv) {
         }
     }
 
+    /* RAM is one slot from address 0, so it must end below the display
+     * region (0xF8000000), above which lie the device BARs and the I/O and
+     * local APICs; RAM over them would answer in their place. */
+    if (ram_mb < 16 || ram_mb > VMDISPLAY_GUEST_ADDR / (1024 * 1024)) {
+        fprintf(stderr, "[9vm] -m must be from 16 to %llu MB\n",
+                (unsigned long long)(VMDISPLAY_GUEST_ADDR / (1024 * 1024)));
+        return 1;
+    }
     size_t ram_size = ram_mb * 1024 * 1024;
 
     int kvm = open("/dev/kvm", O_RDWR | O_CLOEXEC);
@@ -2511,7 +2340,6 @@ int main(int argc, char **argv) {
                     hostring_stop();
                     hostfs_free(&hostfs_inst);
                     if (diskfs_inst != NULL) { hostfs_free(diskfs_inst); free(diskfs_inst); }
-                    if (netfs_fd >= 0) close(netfs_fd);
                     if (tapfd >= 0) close(tapfd);
                     return 0;
                 } else if (run->io.port == 0x80) {
@@ -2630,7 +2458,6 @@ int main(int argc, char **argv) {
     hostring_stop();
     hostfs_free(&hostfs_inst);
     if (diskfs_inst != NULL) { hostfs_free(diskfs_inst); free(diskfs_inst); }
-    if (netfs_fd >= 0) close(netfs_fd);
     if (tapfd >= 0) close(tapfd);
     return 0;
 }
